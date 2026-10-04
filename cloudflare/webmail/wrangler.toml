@@ -1,0 +1,12 @@
+name = "feely-mail-bridge"
+# Set CLOUDFLARE_ACCOUNT_ID in your local environment before deployment.
+main = "worker.mjs"
+compatibility_date = "2026-10-03"
+workers_dev = true
+
+[vars]
+MAILBOX_ADDRESS = "info@feel-y.com"
+
+[[r2_buckets]]
+binding = "MAIL_SPOOL"
+bucket_name = "feely-mail-spool"
