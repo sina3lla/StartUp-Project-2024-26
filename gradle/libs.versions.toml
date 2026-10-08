@@ -24,6 +24,11 @@ camerax = "1.6.2"
 # "1.+", "latest.release"); replace it only with another version confirmed the
 # same way and re-document the source.
 filament = "1.56.0"
+# com.google.android.filament:filamat-android — same verified version as filament-android.
+# See docs/reference/FILAMAT_ANDROID.md for the full Maven Central verification record
+# (maven-metadata.xml listing, resolving POM/AAR, and source-confirmed API). Never set this
+# back to a dynamic/wildcard version; replace only with another version verified the same way.
+filamat = "1.56.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -44,6 +49,7 @@ androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", 
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "camerax" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "camerax" }
 filament-android = { group = "com.google.android.filament", name = "filament-android", version.ref = "filament" }
+filamat-android = { group = "com.google.android.filament", name = "filamat-android", version.ref = "filamat" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
