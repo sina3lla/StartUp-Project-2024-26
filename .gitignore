@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.pytest_tmp*/
+.test-tmp-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -17,6 +19,9 @@ ENV/
 # Environment and secrets
 .env
 .env.*
+.dev.vars
+.wrangler/
+node_modules/
 !.env.example
 
 # Local databases and generated files

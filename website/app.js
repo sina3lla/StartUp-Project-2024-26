@@ -113,10 +113,6 @@ const state = {
     token: "",
     widgetId: null,
   },
-  google: {
-    config: { enabled: false, client_id: null },
-    buttonRendered: false,
-  },
   account: null,
   subscription: null,
   journalEntries: [],
@@ -143,8 +139,6 @@ const websiteInput = document.querySelector("#website");
 const captchaField = document.querySelector("#captcha-field");
 const captchaWidget = document.querySelector("#captcha-widget");
 const captchaStatus = document.querySelector("#captcha-status");
-const googleAuthField = document.querySelector("#google-auth-field");
-const googleButton = document.querySelector("#google-button");
 const logoutButton = document.querySelector("#logout-button");
 const accountButton = document.querySelector("#account-button");
 const newChatButton = document.querySelector("#new-chat-button");
@@ -166,6 +160,8 @@ const topicAccept = document.querySelector("#topic-accept");
 const topicDismiss = document.querySelector("#topic-dismiss");
 const topicRouting = document.querySelector("#topic-routing");
 const topicTarget = document.querySelector("#topic-target");
+const topicEntryCategoryField = document.querySelector("#topic-entry-category-field");
+const topicEntryCategory = document.querySelector("#topic-entry-category");
 const topicMatchBadge = document.querySelector("#topic-match-badge");
 const topicRouteHint = document.querySelector("#topic-route-hint");
 const topicParent = document.querySelector("#topic-parent");
@@ -225,10 +221,6 @@ const journalSidebarAccess = document.querySelector("#journal-sidebar-access");
 const journalSidebarLocked = document.querySelector("#journal-sidebar-locked");
 const journalSuggestions = document.querySelector("#journal-suggestions");
 const journalSuggestionList = document.querySelector("#journal-suggestion-list");
-const practiceDialog = document.querySelector("#practice-dialog");
-const practiceForm = document.querySelector("#practice-form");
-const practiceText = document.querySelector("#practice-text");
-const practiceTopic = document.querySelector("#practice-topic");
 const reflectionDialog = document.querySelector("#reflection-dialog");
 const reflectionForm = document.querySelector("#reflection-form");
 const practiceReflection = document.querySelector("#practice-reflection");
@@ -304,7 +296,6 @@ const TOPIC_POLL_DELAYS = [700, 1800, 4000, 8000];
 
 let lastAuthSubmitAt = 0;
 let turnstileScriptPromise = null;
-let googleScriptPromise = null;
 let billingResultTimer = null;
 let journalSaveTimer = null;
 
@@ -367,6 +358,9 @@ async function api(path, options = {}) {
   }
 
   if (!response.ok) {
+    if (response.status === 423 && requestToken === state.token) {
+      ensureTermsAccepted().catch(renderInlineError);
+    }
     const detail = payload?.detail || (
       responseType.includes("text/html") || responseText.includes("trusted folder")
         ? "The FeelY page reached a file server instead of the backend. Check the API URL."
@@ -395,6 +389,9 @@ async function apiStream(path, options, onEvent) {
   }
   checkSessionResponse(response, requestToken);
   if (!response.ok || !response.body) {
+    if (response.status === 423 && requestToken === state.token) {
+      ensureTermsAccepted().catch(renderInlineError);
+    }
     let detail = "Request failed";
     try {
       detail = (await response.json()).detail || detail;
@@ -427,3 +424,12 @@ async function loadUser() {
   state.account = state.user;
   renderUser();
 }
+
+const verificationDialog = document.querySelector("#email-verification-dialog");
+const verificationForm = document.querySelector("#email-verification-form");
+const verificationEmail = document.querySelector("#verification-email");
+const verificationPin = document.querySelector("#verification-pin");
+const verificationStatus = document.querySelector("#verification-status");
+const verificationResend = document.querySelector("#verification-resend");
+const activateAccountButton = document.querySelector("#activate-account-button");
+

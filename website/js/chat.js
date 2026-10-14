@@ -21,7 +21,9 @@ async function loadChats() {
 }
 
 function startNewChat() {
+  state.chatNavigation = (state.chatNavigation || 0) + 1;
   stopPolling();
+  document.querySelector("#map-analysis-retry").classList.add("hidden");
   state.activeChatId = null;
   chatTitle.textContent = "New conversation";
   document.title = "New conversation | FeelY";
@@ -34,9 +36,11 @@ function startNewChat() {
 }
 
 async function loadChat(chatId) {
+  const navigation = state.chatNavigation = (state.chatNavigation || 0) + 1;
   const chat = await api(`/llm/chats/${encodeURIComponent(chatId)}`, {
     headers: authHeaders(),
   });
+  if (navigation !== state.chatNavigation) return;
   state.activeChatId = chat.chat_id;
   const existing = state.chats.find((item) => item.chat_id === chat.chat_id) || {};
   const completeChat = { ...existing, ...chat };
@@ -45,16 +49,22 @@ async function loadChat(chatId) {
   chatTitle.textContent = chat.title || "New conversation";
   document.title = `${chat.title || "Conversation"} | FeelY`;
   renderMessages(chat.messages || []);
+  if (completeChat.failedDraft && !messageInput.value && !state.chatRequest) {
+    messageInput.value = completeChat.failedDraft;
+    autoresizeMessageInput();
+    if (completeChat.replyError) renderInlineError(completeChat.replyError);
+  }
   renderTopic(chat.pending_topic || null);
   renderMapSuggestion(chat.pending_map_suggestion || null);
   renderChats();
   closeSidebar();
-  await pollTopicOnce();
+  const analysisFinished = await pollTopicOnce();
+  if (!analysisFinished && state.activeChatId === chatId) pollTopicSoon();
 }
 
 async function deleteChat(chat) {
   const title = chat.title || "New conversation";
-  if (!window.confirm(`Delete "${title}"? This cannot be undone.`)) return;
+  if (!await confirmAction(`Delete "${title}"? This cannot be undone.`)) return;
 
   await api(`/llm/chats/${encodeURIComponent(chat.chat_id)}`, {
     method: "DELETE",
@@ -183,7 +193,8 @@ function renderChats() {
   });
 }
 
-function renderMessages(items) {
+function renderMessages(items, followLatest = true) {
+  const previousScrollTop = messages.scrollTop;
   messages.replaceChildren();
   if (!items.length) {
     const empty = document.createElement("section");
@@ -221,6 +232,7 @@ function renderMessages(items) {
 
     empty.append(mark, heading, copy, suggestions);
     messages.append(empty);
+    restoreActiveReply();
     return;
   }
 
@@ -228,20 +240,22 @@ function renderMessages(items) {
     const bubble = document.createElement("article");
     bubble.className = `message ${item.role === "user" ? "user" : "assistant"}`;
     bubble.textContent = item.content || "";
+    if (item.role === "assistant" && item.created_at) addReplyReactions(bubble, item);
     messages.append(bubble);
   });
-  messages.scrollTop = messages.scrollHeight;
+  restoreActiveReply();
+  messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
 }
 
 function showWaitingMessage() {
   const bubble = document.createElement("article");
   bubble.className = "message assistant waiting-message";
   bubble.setAttribute("role", "status");
-  bubble.setAttribute("aria-label", "FeelY is thinking");
+  bubble.setAttribute("aria-label", "FeelY - Weaving a reply");
 
   const label = document.createElement("span");
   label.className = "waiting-label";
-  label.textContent = "FeelY is thinking";
+  label.textContent = "FeelY - Weaving a reply";
 
   const dots = document.createElement("span");
   dots.className = "waiting-dots";
@@ -258,6 +272,7 @@ function showWaitingMessage() {
 
 function appendStreamingText(bubble, text) {
   if (!text) return;
+  const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
 
   let content = bubble.querySelector(".streaming-content");
   if (!content) {
@@ -274,8 +289,82 @@ function appendStreamingText(bubble, text) {
     bubble.replaceChildren(content, cursor);
   }
 
-  content.append(document.createTextNode(text));
-  messages.scrollTop = messages.scrollHeight;
+  const chunk = document.createElement("span");
+  chunk.className = "streaming-chunk";
+  chunk.textContent = text;
+  content.append(chunk);
+  if (followLatest) messages.scrollTop = messages.scrollHeight;
+}
+
+// Reveal short phrases with breathing room at punctuation. Keep timing
+// across network gaps so the cadence does not depend on packet boundaries.
+function createChatTextPlayer(bubble) {
+  let pending = "";
+  let timer = null;
+  let stopped = false;
+  let finishing = false;
+  let nextRevealAt = 0;
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const sentenceEnd = /[.!?\u3002\uff01\uff1f]["'\u201d\u2019)]*\s*$/u;
+  const clauseEnd = /[,;:\u2014\u3001\uff0c]["'\u201d\u2019)]*\s*$/u;
+  function schedule() {
+    timer = setTimeout(tick, Math.max(24, nextRevealAt - performance.now()));
+  }
+  function tick() {
+    timer = null;
+    if (stopped) return;
+    if (!bubble.isConnected) { cancel(); return; }
+    const instant = reducedMotion || document.hidden;
+    let text = "";
+    if (instant) {
+      text = pending;
+      pending = "";
+    } else {
+      const groupSize = pending.length > 720 ? 4 : 2;
+      for (let index = 0; index < groupSize; index += 1) {
+        // Also recognize sentence boundaries in languages without spaces.
+        const word = pending.match(/^(?:\s+|\S+?(?:\s+|[\u3002\uff01\uff1f]))/u);
+        if (!word) break;
+        text += word[0];
+        pending = pending.slice(word[0].length);
+        if (sentenceEnd.test(text) || clauseEnd.test(text) || /\n\s*\n/.test(text)) break;
+      }
+    }
+    appendStreamingText(bubble, text);
+    if (text && !instant) {
+      const phraseTime = 90 + Math.min(130, Array.from(text.trim()).length * 4);
+      const pause = /\n\s*\n/.test(text) ? 360 : sentenceEnd.test(text) ? 260 : clauseEnd.test(text) ? 130 : 0;
+      nextRevealAt = performance.now() + phraseTime + pause;
+    }
+    if (pending && text) schedule();
+
+  }
+  function cancel() {
+    stopped = true;
+    clearTimeout(timer);
+    pending = "";
+  }
+  return {
+    push(text) {
+      if (stopped || finishing) return;
+      pending += text;
+      if (timer === null) schedule();
+    },
+    finish() {
+      if (stopped || finishing) return Promise.resolve();
+      finishing = true;
+      clearTimeout(timer);
+      timer = null;
+      // The response is complete: never hold its ending behind the animation.
+      if (bubble.isConnected) {
+        appendStreamingText(bubble, pending);
+        bubble.classList?.add("streaming-complete");
+      }
+      pending = "";
+      return Promise.resolve();
+    },
+    cancel,
+  };
 }
 
 function topicContentsLabel(space) {
@@ -292,7 +381,7 @@ function updateTopicRoutePresentation() {
   if (!topic) return;
   const spaces = state.map?.topic_spaces || [];
   const selectedSpace = spaces.find((space) => space.id === topicTarget.value);
-  const isRecommended = selectedSpace?.id === topic.existing_topic_id;
+  const isRecommended = Boolean(selectedSpace && selectedSpace.id === topic.existing_topic_id);
   topicCategory.value = selectedSpace ? topicCategoryOf(selectedSpace) : topic.category || "other";
   topicCategory.syncChoices();
   topicConnections.querySelectorAll("input").forEach((input) => {
@@ -301,6 +390,7 @@ function updateTopicRoutePresentation() {
   });
 
   topicParentField.classList.toggle("hidden", Boolean(selectedSpace));
+  topicEntryCategoryField.classList.toggle("hidden", !selectedSpace);
   topicMatchBadge.classList.toggle("hidden", !isRecommended);
   topicNameLabel.textContent = selectedSpace ? "Detected aspect" : "New topic name";
   if (selectedSpace) {
@@ -309,7 +399,8 @@ function updateTopicRoutePresentation() {
       `${prefix}This chat will join “${selectedSpace.title}” ` +
       `(${topicContentsLabel(selectedSpace)}), so no extra map bubble is created. ` +
       "The same chat can also belong to other topics.";
-    topicAccept.textContent = "Connect chat";
+    topicRouteHint.textContent += " Your description will also be saved as a note in this topic.";
+    topicAccept.textContent = "Add to topic";
   } else {
     topicRouteHint.textContent =
       "This creates a new map topic and connects this chat to it. Its name is independent from the conversation name.";
@@ -318,7 +409,9 @@ function updateTopicRoutePresentation() {
 }
 
 function renderTopic(topic) {
+  document.querySelector("#topic-review-dialog .review-error")?.remove();
   state.pendingTopic = topic;
+  updateChatReviewNotice("topic", Boolean(topic), topic ? `Review topic: ${topic.topic || "New topic"}` : "Review topic");
   topicCard.classList.toggle("hidden", !topic);
   if (!topic) {
     topicTitle.value = "";
@@ -332,6 +425,7 @@ function renderTopic(topic) {
   }
   topicTitle.value = topic.topic || "";
   topicDescription.value = topic.description || "";
+  fillEntryCategorySelect(topicEntryCategory);
   topicCategory.value = topic.category || "other";
   topicConnections.replaceChildren(createTopicConnections(topic.related_topic_ids || []));
   const queueTotal = Number(topic.queue_total || 1);
@@ -382,7 +476,9 @@ function renderTopic(topic) {
 }
 
 function renderMapSuggestion(suggestion) {
+  document.querySelector("#map-suggestion-review-dialog .review-error")?.remove();
   if (!hasMyMapAccess()) suggestion = null;
+  updateChatReviewNotice("map-suggestion", Boolean(suggestion), "Review map note");
   state.pendingMapSuggestion = suggestion;
   mapSuggestionCard.classList.toggle("hidden", !suggestion);
   if (!suggestion) {
@@ -395,8 +491,7 @@ function renderMapSuggestion(suggestion) {
     return;
   }
 
-  mapSuggestionCategory.textContent =
-    MAP_CATEGORY_LABELS[suggestion.category] || suggestion.category;
+  fillEntryCategorySelect(mapSuggestionCategory, suggestion.category);
   mapSuggestionTopic.textContent = suggestion.topic_title
     ? `Topic: ${suggestion.topic_title}`
     : "Not connected to a topic yet";
@@ -420,72 +515,127 @@ function renderMapSuggestion(suggestion) {
   }
 }
 
+function updateSendControl() {
+  const request = state.chatRequest;
+  const active = request && request.chatId === state.activeChatId;
+  sendButton.disabled = Boolean(request && !active);
+  sendButton.classList.toggle("is-stopping", Boolean(active));
+  sendButton.title = active ? "Stop response" : "Send message";
+  sendButton.setAttribute("aria-label", sendButton.title);
+  sendButton.innerHTML = active ? '<span class="stop-square" aria-hidden="true"></span>' : '<span aria-hidden="true">&#8593;</span>';
+}
+
+function restoreActiveReply() {
+  updateSendControl();
+  const request = state.chatRequest;
+  if (!request || request.chatId !== state.activeChatId) return;
+  messages.querySelector(".empty-chat")?.remove();
+  const user = document.createElement("article");
+  user.className = "message user";
+  user.textContent = request.context;
+  messages.append(user);
+  request.player?.cancel();
+  request.bubble = showWaitingMessage();
+  if (request.text) appendStreamingText(request.bubble, request.text);
+  request.player = createChatTextPlayer(request.bubble);
+}
+
+function addReplyReactions(bubble, item) {
+  const chatId = state.activeChatId;
+  const controls = document.createElement("div");
+  controls.className = "reply-reactions";
+  for (const [value, symbol] of [["like", "\u{1F44D}"], ["dislike", "\u{1F44E}"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = symbol;
+    button.title = value === "like" ? "Helpful reply" : "Unhelpful reply";
+    button.setAttribute("aria-label", button.title);
+    button.setAttribute("aria-pressed", String(item.reaction === value));
+    button.addEventListener("click", async () => {
+      for (const control of controls.children) control.disabled = true;
+      try {
+        const reaction = item.reaction === value ? null : value;
+        await api(`/llm/chats/${encodeURIComponent(chatId)}/reaction`, {
+          method: "PUT", headers: authHeaders(),
+          body: JSON.stringify({created_at: item.created_at, reaction}),
+        });
+        item.reaction = reaction;
+        [...controls.children].forEach((control, index) => control.setAttribute("aria-pressed", String(reaction === ["like", "dislike"][index])));
+      } catch (error) { renderInlineError(error); }
+      finally { for (const control of controls.children) control.disabled = false; }
+    });
+    controls.append(button);
+  }
+  bubble.append(controls);
+}
+
 async function sendMessage(event) {
   event.preventDefault();
+  if (state.chatRequest) {
+    if (state.chatRequest.chatId === state.activeChatId) state.chatRequest.controller.abort();
+    return;
+  }
   const context = messageInput.value.trim();
   if (!context || sendButton.disabled) return;
-
-  sendButton.disabled = true;
+  const request = {chatId: state.activeChatId, context, text: "", controller: new AbortController(), token: state.token, navigation: state.chatNavigation};
+  state.chatRequest = request;
   messageInput.value = "";
   autoresizeMessageInput();
-
-  const currentChat = state.chats.find((chat) => chat.chat_id === state.activeChatId);
-  const existingMessages = currentChat?.messages || [];
-  renderMessages([...existingMessages, { role: "user", content: context }]);
-  const waitingMessage = showWaitingMessage();
-  const waitingLabel = waitingMessage.querySelector(".waiting-label");
-
+  updateSendControl();
   try {
+    if (!request.chatId) {
+      const chat = await api("/llm/chats", {method: "POST", headers: authHeaders(), body: "{}", signal: request.controller.signal});
+      request.chatId = chat.chat_id;
+      if (request.token !== state.token) return;
+      upsertChat(chat);
+      if (state.activeChatId === null && state.chatNavigation === request.navigation) state.activeChatId = chat.chat_id;
+    }
+    const currentChat = state.chats.find(chat => chat.chat_id === request.chatId);
+    if (state.activeChatId === request.chatId) renderMessages(currentChat?.messages || []);
+    renderChats();
     let response = null;
     await apiStream("/llm/message/stream", {
-      method: "POST",
-      headers: authHeaders(),
-      body: JSON.stringify({
-        chat_id: state.activeChatId,
-        context,
-      }),
-    }, (event) => {
-      if (event.type === "status" && waitingLabel) {
-        const elapsed = event.elapsed_seconds ? ` - ${event.elapsed_seconds}s` : "";
-        waitingLabel.textContent = `${event.message}${elapsed}`;
-        messages.scrollTop = messages.scrollHeight;
-      } else if (event.type === "text_delta" && typeof event.text === "string") {
-        appendStreamingText(waitingMessage, event.text);
-      } else if (event.type === "result") {
-        response = event.data;
-      } else if (event.type === "error") {
-        throw new ApiError(event.message || "Request failed", event.status || 500);
-      }
+      method: "POST", headers: authHeaders(), signal: request.controller.signal,
+      body: JSON.stringify({chat_id: request.chatId, context}),
+    }, event => {
+      if (event.type === "text_delta" && typeof event.text === "string") {
+        request.text += event.text;
+        if (state.activeChatId === request.chatId) request.player?.push(event.text);
+      } else if (event.type === "result") response = event.data;
+      else if (event.type === "error") throw new ApiError(event.message || "Request failed", event.status || 500);
     });
-    if (!response) throw new ApiError("The response stream ended unexpectedly.", 502);
-    const updatedChat = {
-      chat_id: response.chat_id,
-      title: response.chat_info.title || "New conversation",
-      message_count: response.chat_info.message_count || 0,
-      updated_at: response.chat_info.updated_at,
-      pending_topic: response.chat_info.pending_topic || null,
-      pending_topics: response.chat_info.pending_topics || [],
-      messages: response.chat_info.messages || [],
-      pending_map_suggestion: response.map_suggestion || null,
-    };
-    state.activeChatId = response.chat_id;
+    if (!response) throw new ApiError("The response stream ended unexpectedly. Please retry.", 502);
+    if (request.token !== state.token) return;
+    const updatedChat = {...response.chat_info, chat_id: response.chat_id, messages: response.chat_info.messages || [], pending_map_suggestion: response.map_suggestion || null};
     upsertChat(updatedChat);
-    chatTitle.textContent = updatedChat.title;
-    document.title = `${updatedChat.title} | FeelY`;
+    await request.player?.finish();
+    if (request.token !== state.token || state.chatRequest !== request) return;
+    state.chatRequest = null;
+    if (state.activeChatId === request.chatId) {
+      chatTitle.textContent = updatedChat.title || "Conversation";
+      renderMessages(updatedChat.messages);
+      renderMapSuggestion(updatedChat.pending_map_suggestion);
+      renderTopic(updatedChat.pending_topic);
+      pollTopicSoon();
+    }
     renderChats();
-    renderMessages(updatedChat.messages);
-    renderMapSuggestion(response.map_suggestion || null);
-    renderTopic(updatedChat.pending_topic);
-    pollTopicSoon();
   } catch (error) {
-    waitingMessage.remove();
-    messageInput.value = context;
-    autoresizeMessageInput();
-    renderInlineError(error);
+    const failedChat = state.chats.find(chat => chat.chat_id === request.chatId);
+    if (failedChat && request.token === state.token) {
+      failedChat.failedDraft = context;
+      failedChat.replyError = request.controller.signal.aborted ? "Response stopped." : error.message;
+    }
+    if (request.token === state.token && state.activeChatId === request.chatId) {
+      state.chatRequest = null;
+      renderMessages(state.chats.find(chat => chat.chat_id === request.chatId)?.messages || []);
+      if (!messageInput.value) messageInput.value = context;
+      autoresizeMessageInput();
+      if (!request.controller.signal.aborted) renderInlineError(error);
+    }
   } finally {
-    waitingMessage.remove();
-    sendButton.disabled = false;
-    messageInput.focus();
+    request.player?.cancel();
+    if (state.chatRequest === request) state.chatRequest = null;
+    updateSendControl();
   }
 }
 
@@ -497,6 +647,19 @@ function upsertChat(chat) {
 
 function renderInlineError(error) {
   if (error instanceof ApiError && error.status === 401 && !state.token) return;
+  const review = document.querySelector("#topic-review-dialog[open], #map-suggestion-review-dialog[open]");
+  if (review) {
+    let alert = review.querySelector(".review-error");
+    if (!alert) {
+      alert = document.createElement("p");
+      alert.className = "review-error form-error";
+      alert.setAttribute("role", "alert");
+      review.append(alert);
+    }
+    alert.textContent = error instanceof Error ? error.message : String(error);
+    alert.scrollIntoView({ block: "nearest" });
+    return;
+  }
   if (!mapView.classList.contains("hidden")) {
     let alert = mapContent.querySelector(".map-feedback");
     if (!alert) {
@@ -534,16 +697,17 @@ function renderInlineError(error) {
 
 function pollTopicSoon(attempt = 0) {
   stopPolling();
-  if (attempt >= TOPIC_POLL_DELAYS.length) return;
+  if (!state.activeChatId || !state.token) return;
+  const requestedChatId = state.activeChatId;
   state.pollTimer = setTimeout(async () => {
     state.pollTimer = null;
     try {
       const topicReady = await pollTopicOnce();
-      if (!topicReady) pollTopicSoon(attempt + 1);
+      if (!topicReady && state.activeChatId === requestedChatId) pollTopicSoon(attempt + 1);
     } catch {
-      pollTopicSoon(attempt + 1);
+      if (state.activeChatId === requestedChatId) pollTopicSoon(attempt + 1);
     }
-  }, TOPIC_POLL_DELAYS[attempt]);
+  }, TOPIC_POLL_DELAYS[Math.min(attempt, TOPIC_POLL_DELAYS.length - 1)]);
 }
 
 async function pollTopicOnce() {
@@ -554,6 +718,7 @@ async function pollTopicOnce() {
     { headers: authHeaders() },
   );
   if (state.activeChatId !== requestedChatId) return false;
+  document.querySelector("#map-analysis-retry").classList.toggle("hidden", payload.analysis_status !== "error");
   if (payload.chat_title) {
     const chat = state.chats.find((item) => item.chat_id === requestedChatId);
     if (chat && chat.title !== payload.chat_title) {
@@ -564,13 +729,37 @@ async function pollTopicOnce() {
     document.title = `${payload.chat_title} | FeelY`;
   }
   const suggestion = payload.suggestions?.[0] || payload.suggestion || null;
-  renderTopic(suggestion);
-  return Boolean(suggestion);
+  // Background observations can arrive without a new topic. Avoid resetting
+  // edits in a review dialog on every poll.
+  if (JSON.stringify(state.pendingTopic) !== JSON.stringify(suggestion)) renderTopic(suggestion);
+  const mapSuggestion = payload.map_suggestion || null;
+  if (JSON.stringify(state.pendingMapSuggestion) !== JSON.stringify(mapSuggestion)) renderMapSuggestion(mapSuggestion);
+  const chat = state.chats.find((item) => item.chat_id === requestedChatId);
+  if (chat) { chat.pending_topic = suggestion; chat.pending_map_suggestion = mapSuggestion; }
+  return !["queued", "analysing"].includes(payload.analysis_status);
+
 }
 
 function startPolling() {
-  stopPolling();
-  pollTopicOnce().catch(() => {});
+  document.querySelector("#map-analysis-retry").classList.add("hidden");
+  pollTopicSoon();
+}
+
+async function retryMapAnalysis() {
+  const chatId = state.activeChatId;
+  if (!chatId) return;
+  const button = document.querySelector("#map-analysis-retry");
+  button.disabled = true;
+  try {
+    await api(`/llm/chats/${encodeURIComponent(chatId)}/topic-suggestion/retry`, {
+      method: "POST", headers: authHeaders(),
+    });
+    if (state.activeChatId === chatId) startPolling();
+  } catch {
+    button.textContent = "Could not retry. Try again shortly";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function stopPolling() {
@@ -581,7 +770,7 @@ function stopPolling() {
 }
 
 async function confirmTopic(accepted) {
-  if (!state.pendingTopic) return;
+  if (!state.pendingTopic || topicAccept.disabled) return;
   const topic = state.pendingTopic;
   const editedTopic = topicTitle.value.trim() || topic.topic;
   const editedDescription = topicDescription.value.trim() || topic.description;
@@ -595,27 +784,42 @@ async function confirmTopic(accepted) {
   const category = topicCategory.value;
   const relatedTopicIds = [...topicConnections.querySelectorAll("input:checked")]
     .map((input) => input.value).filter((id) => id !== existingTopicSpaceId);
-  renderTopic(null);
-  await api("/llm/topics/confirm", {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      chat_id: topic.chat_id,
-      topic: editedTopic,
-      description: editedDescription,
-      category,
-      related_topic_ids: relatedTopicIds,
-      accepted,
-      existing_topic_space_id: existingTopicSpaceId,
-      parent_topic_space_id: parentTopicSpaceId,
-    }),
-  });
-  if (hasMyMapAccess()) await loadMap();
-  await loadChats();
+  topicAccept.disabled = topicDismiss.disabled = true;
+  try {
+    const response = await api("/llm/topics/confirm", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        chat_id: topic.chat_id,
+        require_map_access: true,
+        suggestion_id: topic.suggestion_id || null,
+        entry_category: topicEntryCategory.value || "own_perception",
+        topic: editedTopic,
+        description: editedDescription,
+        category,
+        related_topic_ids: relatedTopicIds,
+        accepted,
+        existing_topic_space_id: existingTopicSpaceId,
+        parent_topic_space_id: parentTopicSpaceId,
+      }),
+    });
+    renderTopic(null);
+    if (response.profile?.self_authorship_map) state.map = response.profile.self_authorship_map;
+    if (accepted && response.saved_topic_space_id) {
+      state.mapFilter = "all";
+      state.activeMapNodeId = response.saved_topic_space_id;
+      state.mapDetailOpen = true;
+      renderMap();
+    }
+    if (hasMyMapAccess()) await loadMap();
+    await loadChats();
+  } finally {
+    topicAccept.disabled = topicDismiss.disabled = false;
+  }
 }
 
 async function confirmMapSuggestion(accepted) {
-  if (!state.pendingMapSuggestion) return;
+  if (!state.pendingMapSuggestion || mapSuggestionAccept.disabled) return;
   const suggestion = state.pendingMapSuggestion;
   const text = mapSuggestionText.value.trim();
   if (accepted && !text) return;
@@ -623,26 +827,50 @@ async function confirmMapSuggestion(accepted) {
     ? suggestion.topic_space_id
     : mapSuggestionTarget.value || null;
 
-  renderMapSuggestion(null);
-  const response = await api("/llm/map-suggestions/confirm", {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      chat_id: suggestion.source_chat_id || state.activeChatId,
-      accepted,
-      category: suggestion.category,
-      text: text || suggestion.text,
-      reason: suggestion.reason,
-      topic_space_id: targetTopicSpaceId,
-    }),
-  });
-  state.map = response.map;
-  state.activeMapNodeId = targetTopicSpaceId || OVERALL_MAP_NODE_ID;
-  renderMap();
+  mapSuggestionAccept.disabled = mapSuggestionDismiss.disabled = true;
+  try {
+    const response = await api("/llm/map-suggestions/confirm", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        chat_id: suggestion.source_chat_id || state.activeChatId,
+        accepted,
+        category: mapSuggestionCategory.value || suggestion.category,
+        text: text || suggestion.text,
+        reason: suggestion.reason,
+        topic_space_id: targetTopicSpaceId,
+      }),
+    });
+    renderMapSuggestion(null);
+    state.map = response.map;
+    state.activeMapNodeId = targetTopicSpaceId || OVERALL_MAP_NODE_ID;
+    renderMap();
+  } finally {
+    mapSuggestionAccept.disabled = mapSuggestionDismiss.disabled = false;
+  }
+}
+
+function updateChatReviewNotice(kind, available, label) {
+  const button = document.querySelector(`#${kind}-review`);
+  const dialog = document.querySelector(`#${kind}-review-dialog`);
+  button.classList.toggle("hidden", !available);
+  button.textContent = label;
+  button.title = label;
+  if (!available && dialog.open) {
+    dialog.close();
+    messageInput.focus({ preventScroll: true });
+  }
 }
 
 function autoresizeMessageInput() {
+  const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+  const viewportHeight = window.visualViewport?.height || window.innerHeight;
+  const maxHeight = Math.max(84, Math.min(240, Math.floor(viewportHeight * 0.3)));
+  messageInput.style.maxHeight = `${maxHeight}px`;
   messageInput.style.height = "auto";
-  messageInput.style.height = `${Math.min(messageInput.scrollHeight, 160)}px`;
+  const contentHeight = messageInput.scrollHeight;
+  messageInput.style.height = `${Math.min(contentHeight, maxHeight)}px`;
+  messageInput.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
+  if (followLatest) messages.scrollTop = messages.scrollHeight;
 }
 

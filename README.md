@@ -16,6 +16,7 @@ per-user LLM requests, and persistent user profiles.
 - Basic bot and abuse protection for auth, API, and LLM endpoints
 - Request-size limits, security headers, and production config checks
 - SQLite by default, configurable through `DATABASE_URL`
+- Optional synchronous PostgreSQL with psycopg 3 and explicit Alembic migrations
 - Per-user profile storage
 - Chat-LLM endpoint that sends chat context, chat history, and the saved profile to the LLM
 - Background analyser that scores chats with backend pattern rules
@@ -30,8 +31,15 @@ per-user LLM requests, and persistent user profiles.
 
 ## Documentation
 
+- [Backend structure, boundaries and validation](docs/BACKEND_STRUCTURE.md)
+- [Pre-cleanup backend audit and import inventory](docs/BACKEND_STRUCTURE_AUDIT.md)
+- [Database portability audit](docs/DATABASE_PORTABILITY_AUDIT.md)
+- [PostgreSQL setup, migrations, data verification and rollback](docs/DATABASE_MIGRATION.md)
 - [Stripe subscription setup](docs/stripe-setup.md)
 - [Administration and editable prompts](docs/admin.md)
+- [Local webmail and reusable setup](WEBMAIL_SETUP.md)
+- [Android login and versioned AGB acceptance](docs/ANDROID_AND_TERMS.md)
+- [Edit and publish AGB / mandatory acceptance](docs/AGB_SETUP.md)
 - [Bright-theme design guide](docs/BRIGHT_DESIGN.md)
 
 See [docs/CODE_GUIDE.md](docs/CODE_GUIDE.md) for a walkthrough of how the code
@@ -127,18 +135,17 @@ Restart Uvicorn after running the command. Then open
 username and the original password (not the hash).
 
 In the admin page, create accounts or change their role to Member, Test, or Admin.
-Test and Admin accounts can use the map debug preview; only Admin accounts can
-manage users and prompts. Premium access remains separate from roles.
+Only Admin accounts can manage users and prompts. Premium access remains separate from roles.
 
 ### Editing the frontend
 
 See [the frontend editing guide](website/EDITING.md) for the HTML and JavaScript
 file for each feature. Edit `website/views/chat.html`, `website/views/map.html`,
-or `website/views/journal.html`. The small `website/shell.html` defines the shared
-layout. The FeelY website server assembles all views, styles, and scripts into
-one response. For a basic static server, run
-`.venv\Scripts\python.exe scripts/build_frontend.py` after edits to update the
-standalone `website/index.html`. The launcher runs this automatically.
+or `website/views/journal.html`. `website/index.html` is the editable shared layout
+with references to those views. `js/load-views.js` loads the view markup before
+starting the application scripts. HTML, CSS, and JavaScript are served as separate
+files. Serve the whole `website/` directory and refresh after edits; no frontend
+build step is required.
 
 ### Important
 
@@ -393,62 +400,41 @@ Non-local environments refuse to start unless CAPTCHA is enabled with real
 keys; the backend also rejects Cloudflare test keys in production. Restrict the
 production widget to the website's real hostname in the Cloudflare dashboard.
 
-Google account sign-in is optional. Create a Google OAuth Web Client ID for the
-website origin, then enable it:
+### Email activation and password reset
 
-```env
-GOOGLE_AUTH_ENABLED=true
-GOOGLE_CLIENT_ID="your-google-web-client-id"
-GOOGLE_ALLOWED_HOSTED_DOMAIN=""
-```
+The email setup guide is [EMAIL_SETUP.md](EMAIL_SETUP.md). Configure a real
+sending provider for `noreply@feel-y.com` and its SMTP credentials before
+turning on account emails. The application does not provision a mailbox.
 
-The frontend loads Google Identity Services only when enabled. It sends the
-Google ID token to `POST /api/v1/auth/google`; the backend verifies the token,
-checks the configured client ID, and links the account through Google's stable
-subject ID.
+With `EMAIL_VERIFICATION_ENABLED=true`, new password accounts must enter a
+six-digit email PIN before logging in. PINs expire after 15 minutes by default,
+allow five attempts, and can only be used once. Resending replaces the old PIN.
+Users can reopen **Activate account / enter email PIN** on the login page or
+request a code through Account settings. Already-issued verification links
+remain valid until their original expiry. Existing accounts already marked verified
+remain verified.
 
-Verification email is also possible, but it needs an email delivery provider.
-Use SMTP credentials from a service such as your domain host, Postmark,
-SendGrid, Mailgun, AWS SES, or another transactional email provider. You also
-need a public frontend URL so the email link can point back to the app:
+`PASSWORD_RESET_ENABLED=true` enables **Forgot your password?** emails through
+the same SMTP connection. Links point to `PUBLIC_APP_URL`, expire after 60
+minutes by default, and can only be used once. Resetting a password does not
+activate an unverified account. Existing sessions keep their original expiry.
 
-```env
-EMAIL_VERIFICATION_ENABLED=true
-EMAIL_VERIFICATION_REQUIRED=false
-EMAIL_VERIFICATION_TOKEN_EXPIRE_HOURS=24
-PUBLIC_APP_URL="https://your-site.example"
-SMTP_HOST="smtp.example.com"
-SMTP_PORT=587
-SMTP_USERNAME="smtp-user"
-SMTP_PASSWORD="smtp-password"
-SMTP_FROM_EMAIL="hello@your-site.example"
-SMTP_USE_TLS=true
-```
+### Test feedback
 
-When enabled, registration creates an unverified account and emails a one-time
-verification link. Users can also request another email from Account settings.
-Set `EMAIL_VERIFICATION_REQUIRED=true` only after SMTP delivery is working,
-because unverified password users cannot log in when it is required.
+Set `FEEDBACK_ENABLED=true` and restart the backend to show **Share test
+feedback** in the signed-in sidebar. Feedback is stored in the database's
+`feedback` table and can be read in the **Feedback inbox** at `/admin.html`.
+The inbox includes the sender's account email, category, message, and time;
+chat content is never automatically attached. Set `FEEDBACK_EMAIL_TO` to
+`info@feel-y.com` for best-effort SMTP notifications in addition to database
+storage. Clear it to use feedback without an email provider. Notification
+failures leave saved feedback available in admin; automatic retries are not
+implemented. Emailed copies are not removed by account deletion.
 
-### Password reset email
-
-Password reset uses the same SMTP connection. FeelY sends the messages, but it
-does not host a mailbox or automatically create an account with an email
-provider. Add the SMTP credentials supplied by your chosen provider above,
-verify that its sender/domain is allowed, and then enable reset links:
-
-```env
-PASSWORD_RESET_ENABLED=true
-PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=60
-RATE_LIMIT_PASSWORD_RESET_IDENTIFIER_PER_HOUR=3
-PUBLIC_APP_URL="https://app.feel-y.com"
-```
-
-Restart FastAPI after editing `.env`. The login page's **Forgot password?**
-action always gives the same response whether an address exists or not. For a
-matching active account, it emails a one-time link back to the website root; the link
-expires after the configured number of minutes. Keep
-`PASSWORD_RESET_ENABLED=false` until SMTP delivery has been tested.
+Set `FEEDBACK_ENABLED=false` and restart to hide the form on refresh and reject
+new submissions immediately, including from already-open tabs. Existing
+feedback remains available to administrators. Feedback is deleted along with
+its author's account. Submissions are limited to five per account per hour.
 
 ### Premium journal
 
@@ -477,10 +463,8 @@ configuration.
 
 - `GET /api/v1/health`
 - `GET /api/v1/auth/captcha/config`
-- `GET /api/v1/auth/google/config`
 - `POST /api/v1/auth/register`
 - `POST /api/v1/auth/login`
-- `POST /api/v1/auth/google`
 - `POST /api/v1/auth/email-verification/request`
 - `POST /api/v1/auth/email-verification/confirm`
 - `POST /api/v1/auth/password-reset/request`

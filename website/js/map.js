@@ -95,67 +95,23 @@ function renderMapSidebar() {
   });
 }
 
-function createMapEntryElement(entry) {
-  const item = document.createElement("article");
-  item.className = "map-entry";
-  item.dataset.category = entry.category;
-
-  const label = document.createElement("span");
-  label.className = "map-entry-label";
-  label.textContent = MAP_CATEGORY_LABELS[entry.category] || entry.category;
-
-  const text = document.createElement("p");
-  text.textContent = entry.text;
-  item.append(label, text);
-
-  if (entry.category === "practice") {
-    const status = document.createElement("span");
-    status.className = "practice-status";
-    status.textContent = entry.status || "active";
-    item.append(status);
-
-    const controls = document.createElement("div");
-    controls.className = "practice-controls";
-    if (entry.status !== "completed") {
-      const toggle = document.createElement("button");
-      toggle.type = "button";
-      toggle.textContent = entry.status === "paused" ? "Resume" : "Pause";
-      toggle.addEventListener("click", () => {
-        updatePractice(entry.id, entry.status === "paused" ? "active" : "paused").catch(
-          renderInlineError,
-        );
-      });
-
-      const complete = document.createElement("button");
-      complete.type = "button";
-      complete.textContent = "Reflect and complete";
-      complete.addEventListener("click", () => openReflectionDialog(entry.id));
-      controls.append(toggle, complete);
-    } else {
-      const reactivate = document.createElement("button");
-      reactivate.type = "button";
-      reactivate.textContent = "Practice again";
-      reactivate.addEventListener("click", () => updatePractice(entry.id, "active").catch(renderInlineError));
-      controls.append(reactivate);
-    }
-    item.append(controls);
-
-    if (entry.reflection) {
-      const reflection = document.createElement("p");
-      reflection.className = "practice-reflection";
-      reflection.textContent = entry.reflection;
-      item.append(reflection);
-    }
-  }
-  return item;
-}
-
 const TOPIC_CATEGORIES = {
   person: { label: "Person", plural: "People" },
   trait: { label: "Trait", plural: "Traits" },
   experience: { label: "Experience", plural: "Experiences" },
   other: { label: "Other", plural: "Other" },
 };
+
+function fillEntryCategorySelect(select, selected = "own_perception") {
+  select.replaceChildren();
+  Object.entries(MAP_CATEGORY_LABELS).filter(([value]) => value !== "merged_topic").forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.append(option);
+  });
+  select.value = Object.hasOwn(MAP_CATEGORY_LABELS, selected) && selected !== "merged_topic" ? selected : "own_perception";
+}
 
 function topicCategoryOf(topic) {
   return Object.hasOwn(TOPIC_CATEGORIES, topic.category) ? topic.category : "other";
@@ -260,6 +216,25 @@ function mapNodePosition(index) {
   };
 }
 
+// Mobile has room for two bubbles across. Grow the canvas instead of
+// squeezing additional topics into the same positions.
+function layoutMobileMap(nodes) {
+  const hasOverall = nodes[0]?.id === OVERALL_MAP_NODE_ID;
+  const positions = nodes.map((node, index) => {
+    if (hasOverall && index === 0) return { x: 50, y: 64 };
+    const slot = index - (hasOverall ? 1 : 0);
+    return {
+      x: slot % 2 ? 74 : 26,
+      y: (hasOverall ? 184 : 64) + Math.floor(slot / 2) * 120 + (slot % 2) * 28,
+    };
+  });
+  const height = Math.max(430, ...positions.map((position) => position.y + 76));
+  nodes.forEach((node, index) => {
+    node.position = { x: positions[index].x, y: positions[index].y / height * 100 };
+  });
+  return height;
+}
+
 function createConceptNode(node, index) {
   const button = document.createElement("button");
   button.type = "button";
@@ -362,7 +337,7 @@ async function updateMapEntry(entryId, payload) {
 }
 
 async function deleteMapEntry(entry) {
-  if (!window.confirm("Delete this map entry? This cannot be undone.")) return;
+  if (!await confirmAction("Delete this map entry? This cannot be undone.")) return;
   const response = await api(`/users/me/map/entries/${encodeURIComponent(entry.id)}`, {
     method: "DELETE",
     headers: authHeaders(),
@@ -441,192 +416,6 @@ async function saveMapPopup(form, save) {
     form.removeAttribute("aria-busy");
     buttons.forEach((button, index) => { button.disabled = disabled[index]; });
   }
-}
-
-function openMapRefreshPopup() {
-  if (!["admin", "test"].includes(state.user?.role)) return;
-  closeMapActionPopup();
-  const backdrop = document.createElement("div");
-  backdrop.className = "map-action-backdrop";
-  const popup = document.createElement("section");
-  popup.className = "map-action-popup map-refresh-popup";
-  popup.setAttribute("role", "dialog");
-  popup.setAttribute("aria-modal", "true");
-  popup.setAttribute("aria-label", "Update older map topics");
-  const close = document.createElement("button");
-  close.type = "button";
-  close.className = "map-action-close";
-  close.setAttribute("aria-label", "Close preview");
-  close.textContent = "x";
-  close.addEventListener("click", closeMapActionPopup);
-  const title = document.createElement("h3");
-  title.textContent = "Update older map topics";
-  const intro = document.createElement("p");
-  intro.textContent = "Generate simpler names, short descriptions, and topic types. Review and edit each suggestion before applying it. Your saved reflections, chats, journals, and connections stay attached.";
-  const status = document.createElement("p");
-  status.className = "map-refresh-status";
-  status.setAttribute("role", "status");
-  const generate = document.createElement("button");
-  generate.type = "button";
-  generate.textContent = "Generate preview";
-  const form = document.createElement("form");
-  form.className = "map-action-form";
-  const rows = document.createElement("div");
-  rows.className = "map-refresh-rows";
-  const apply = document.createElement("button");
-  apply.type = "submit";
-  apply.textContent = "Apply selected updates";
-  apply.disabled = true;
-  const undo = document.createElement("button");
-  undo.type = "button";
-  undo.textContent = "Undo this update";
-  undo.hidden = true;
-  let revision = null;
-  let originals = [];
-  let busy = false;
-  let stale = false;
-  form.append(generate, status, rows, apply, undo);
-  popup.append(close, title, intro, form);
-  backdrop.append(popup);
-  backdrop.addEventListener("click", (event) => {
-    if (event.target === backdrop) closeMapActionPopup();
-  });
-  mountMapPopup(backdrop);
-  generate.focus();
-
-  generate.addEventListener("click", async () => {
-    if (busy) return;
-    busy = true;
-    generate.disabled = true;
-    apply.disabled = true;
-    undo.hidden = true;
-    rows.replaceChildren();
-    apply.hidden = false;
-    revision = null;
-    stale = false;
-    originals = [];
-    let failed = 0;
-    try {
-      await loadMap();
-      const topics = state.map?.topic_spaces || [];
-      if (topics.length > 200) throw new Error("This tool supports up to 200 topics at a time. Edit individual topics for larger maps.");
-      for (const [index, topic] of topics.entries()) {
-        if (!backdrop.isConnected) return;
-        status.textContent = `Generating preview ${index + 1} of ${topics.length}. Closing this window stops after the current topic.`;
-        try {
-          const result = await api(`/users/me/map/topics/${encodeURIComponent(topic.id)}/refresh-preview`, {
-            method: "POST", headers: authHeaders(),
-          });
-          if (!backdrop.isConnected) return;
-          if (revision && revision !== result.revision) {
-            stale = true;
-            throw new Error("Your map changed during the preview. Generate a fresh preview.");
-          }
-          revision = result.revision;
-          originals.push(result.original);
-          const row = document.createElement("fieldset");
-          row.className = "map-refresh-row";
-          row.dataset.topicId = topic.id;
-          const legend = document.createElement("legend");
-          legend.textContent = result.original.title;
-          const includeLabel = document.createElement("label");
-          includeLabel.className = "map-refresh-include";
-          const include = document.createElement("input");
-          include.type = "checkbox";
-          include.name = "include_topic";
-          include.checked = true;
-          includeLabel.append(include, document.createTextNode("Apply this topic"));
-          const before = document.createElement("details");
-          const summary = document.createElement("summary");
-          summary.textContent = "Current description";
-          const previous = document.createElement("p");
-          previous.textContent = result.original.description || "No description yet.";
-          before.append(summary, previous);
-          const nameLabel = document.createElement("label");
-          nameLabel.textContent = "Suggested name";
-          const name = document.createElement("input");
-          name.name = "refresh_title";
-          name.required = true;
-          name.maxLength = 120;
-          name.value = result.suggested.title;
-          nameLabel.append(name);
-          const category = createTopicCategorySelect(result.suggested.category);
-          const descriptionLabel = document.createElement("label");
-          descriptionLabel.textContent = "Suggested description";
-          const description = document.createElement("textarea");
-          description.name = "refresh_description";
-          description.maxLength = 2000;
-          description.rows = 3;
-          description.value = result.suggested.description;
-          descriptionLabel.append(description);
-          row.append(legend, includeLabel, before, nameLabel, category, descriptionLabel);
-          include.addEventListener("change", () => {
-            row.querySelectorAll("input:not([type='checkbox']), select, textarea").forEach((field) => { field.disabled = !include.checked; });
-          });
-          rows.append(row);
-        } catch (error) {
-          failed += 1;
-          const failure = document.createElement("p");
-          failure.className = "map-form-error";
-          failure.textContent = `${topic.title}: ${error.message}`;
-          rows.append(failure);
-          if (stale || [401, 402, 429, 503].includes(error.status)) break;
-        }
-      }
-      status.textContent = stale ? "Your map changed. Generate a fresh preview before applying." :
-        `${originals.length} topics ready for review${failed ? `; ${failed} could not be previewed` : ""}. Nothing has been saved.`;
-      if (!topics.length) status.textContent = "There are no topics to update yet.";
-      apply.disabled = stale || originals.length === 0;
-    } catch (error) {
-      status.textContent = error.message;
-    } finally {
-      busy = false;
-      generate.disabled = false;
-    }
-  });
-
-  async function applyUpdates(topics) {
-    const result = await api("/users/me/map/refresh/apply", {
-      method: "POST", headers: authHeaders(), body: JSON.stringify({ revision, topics }),
-    });
-    revision = result.revision;
-    state.map = result.map;
-    renderMap();
-  }
-  async function saveUpdates(topics, reverting = false) {
-    if (busy) return;
-    if (!topics.length) { status.textContent = "Select at least one topic to update."; return; }
-    busy = true;
-    backdrop.dataset.busy = "true";
-    [apply, undo, generate, close].forEach((button) => { button.disabled = true; });
-    status.textContent = "Saving...";
-    try {
-      await applyUpdates(topics);
-      if (!reverting) originals = originals.filter((topic) => topics.some((update) => update.id === topic.id));
-      rows.querySelectorAll("input, select, textarea").forEach((field) => { field.disabled = true; });
-      status.textContent = reverting ? "The previous names, descriptions, and types have been restored." : `${topics.length} topics updated. All saved contents and connections were kept.`;
-      apply.hidden = true;
-      undo.hidden = reverting;
-    } catch (error) {
-      status.textContent = error.message;
-    } finally {
-      busy = false;
-      backdrop.dataset.busy = "false";
-      [apply, undo, generate, close].forEach((button) => { button.disabled = false; });
-    }
-  }
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const topics = [...rows.querySelectorAll(".map-refresh-row")]
-      .filter((row) => row.querySelector("[name='include_topic']").checked)
-      .map((row) => ({ id: row.dataset.topicId,
-        title: row.querySelector("[name='refresh_title']").value.trim(),
-        category: row.querySelector("select").value,
-        description: row.querySelector("textarea").value.trim(),
-      }));
-    saveUpdates(topics);
-  });
-  undo.addEventListener("click", () => saveUpdates(originals, true));
 }
 
 function openMapTopicPopup(topic = null) {
@@ -745,13 +534,13 @@ function openMapTopicPopup(topic = null) {
     mergeTarget.addEventListener("change", () => {
       mergeButton.disabled = !mergeTarget.value;
     });
-    mergeButton.addEventListener("click", () => {
+    mergeButton.addEventListener("click", async () => {
       const target = (state.map?.topic_spaces || []).find(
         (space) => space.id === mergeTarget.value,
       );
       if (!target) return;
       if (
-        !window.confirm(
+        !await confirmAction(
           `Merge “${topic.title}” into “${target.title}”? The second topic will be kept.`,
         )
       ) {
@@ -825,7 +614,7 @@ async function updateMapTopic(topicId, payload) {
 
 async function disconnectMapTopicConnection(node, relationship, connectedTopic) {
   if (
-    !window.confirm(
+    !await confirmAction(
       `Disconnect “${node.title}” and “${connectedTopic.title}”? Both topics and their contents will be kept.`,
     )
   ) {
@@ -870,7 +659,7 @@ async function mergeMapTopic(sourceTopicId, targetTopicId) {
 
 async function deleteMapTopic(topic) {
   if (
-    !window.confirm(
+    !await confirmAction(
       "Delete this topic? Its entries will move to Overall instead of being deleted.",
     )
   ) {
@@ -1533,15 +1322,7 @@ function renderMap() {
     });
     filters.append(button);
   });
-  const actions = document.createElement("div");
-  actions.className = "map-toolbar-actions";
-  const refresh = document.createElement("button");
-  refresh.type = "button";
-  refresh.className = "map-toolbar-button";
-  refresh.textContent = "Debug: update old topics";
-  refresh.addEventListener("click", openMapRefreshPopup);
-  if (["admin", "test"].includes(state.user?.role)) actions.append(refresh);
-  toolbar.append(summary, filters, actions);
+  toolbar.append(summary, filters);
 
   const layout = document.createElement("section");
   layout.className = "map-concept-layout";
@@ -1549,6 +1330,11 @@ function renderMap() {
   const board = document.createElement("div");
   board.className = "map-concept-board";
   board.setAttribute("aria-label", "Interactive concept map");
+  if (typeof window !== "undefined" && window.matchMedia("(max-width: 900px)").matches) {
+    const height = layoutMobileMap(visibleNodes);
+    board.style.height = `${height}px`;
+    board.style.minHeight = `${height}px`;
+  }
   board.append(createMapConnectionLayer(visibleNodes));
   visibleNodes.forEach((node, index) => board.append(createConceptNode(node, index)));
   if (!visibleNodes.length) {
@@ -1567,23 +1353,6 @@ function renderMap() {
   mapContent.append(layout);
 }
 
-function openPracticeDialog() {
-  practiceText.value = "";
-  practiceTopic.replaceChildren();
-  const unassigned = document.createElement("option");
-  unassigned.value = "";
-  unassigned.textContent = OVERALL_MAP_TITLE;
-  practiceTopic.append(unassigned);
-  (state.map?.topic_spaces || []).forEach((space) => {
-    const option = document.createElement("option");
-    option.value = space.id;
-    option.textContent = space.title;
-    practiceTopic.append(option);
-  });
-  practiceDialog.showModal();
-  practiceText.focus();
-}
-
 function openReflectionDialog(entryId) {
   state.completingPracticeId = entryId;
   practiceReflection.value = "";
@@ -1594,25 +1363,6 @@ function openReflectionDialog(entryId) {
   }
   reflectionDialog.showModal();
   practiceReflection.focus();
-}
-
-async function createPractice(event) {
-  event.preventDefault();
-  const text = practiceText.value.trim();
-  if (!text) return;
-  const response = await api("/users/me/map/entries", {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      category: "practice",
-      text,
-      topic_space_id: practiceTopic.value || null,
-      source_chat_id: state.activeChatId,
-    }),
-  });
-  state.map = response.map;
-  renderMap();
-  practiceDialog.close();
 }
 
 async function updatePractice(entryId, status, reflection = null) {

@@ -25,6 +25,27 @@ function element() {
   };
 }
 
+test("mobile layout keeps large and filtered maps separated and inside the canvas", () => {
+  const context = vm.createContext({ OVERALL_MAP_NODE_ID: "overall" });
+  vm.runInContext(appFunction("layoutMobileMap"), context);
+  for (const overall of [false, true]) {
+    for (const count of [0, 1, 3, 18, 50]) {
+      const nodes = Array.from({ length: count }, (_,i) => ({ id: overall && i === 0 ? "overall" : `topic-${i}` }));
+      const height = context.layoutMobileMap(nodes);
+      // At the narrowest supported phone size, allow 84px bubble height,
+      // plus room for its hover scale, floating animation and Overall ring.
+      const rects = nodes.map(({ position: p }) => ({ x: p.x / 100 * 280, y: p.y / 100 * height }));
+      for (const [i, a] of rects.entries()) {
+        assert.ok(a.y >= 54 && a.y + 54 <= height);
+        assert.ok(a.x >= 60 && a.x + 60 <= 280);
+        for (const b of rects.slice(i + 1)) {
+          assert.ok(Math.abs(a.x - b.x) >= 120 || Math.abs(a.y - b.y) >= 108, "bubbles must not overlap");
+        }
+      }
+    }
+  }
+});
+
 test("map nodes render with empty or saved entries and open on click", () => {
   const context = vm.createContext({
     document: { createElement: element },
@@ -48,7 +69,7 @@ test("map nodes render with empty or saved entries and open on click", () => {
   }
 });
 
-test("map debug button is rendered only for admin and test accounts", () => {
+test("map renders without the removed debug controls for every role", () => {
   const mapContent = element();
   const context = vm.createContext({
     document: { createElement: element, createElementNS: element },
@@ -63,9 +84,6 @@ test("map debug button is rendered only for admin and test accounts", () => {
     context.state.user = { role };
     context.renderMap();
     assert.equal(descendants(mapContent).some(node => node.textContent === "Debug: update old topics"),
-      role === "test" || role === "admin");
+      false);
   }
-  context.state.user = { role: "member" };
-  // Calling the UI handler directly must also stop before mounting a preview.
-  assert.doesNotThrow(() => context.openMapRefreshPopup());
 });

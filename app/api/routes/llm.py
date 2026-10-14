@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -15,7 +15,7 @@ from app.api.dependencies import get_current_user, get_db
 from app.core.config import settings
 from app.core.rate_limit import enforce_rate_limit
 from app.db.session import SessionLocal
-from app.models.user import ChatSession, DailyLLMUsage, User, UserProfile
+from app.models.user import ChatSession, User, UserProfile
 from app.schemas.llm import (
     ChatCreateRequest,
     ChatRead,
@@ -23,19 +23,21 @@ from app.schemas.llm import (
     LLMResponse,
     MapSuggestionConfirmationRequest,
     MapSuggestionConfirmationResponse,
+    ReplyReactionRequest,
     TopicConfirmationRequest,
     TopicConfirmationResponse,
     TopicSuggestionResponse,
 )
 from app.services.billing import has_premium_feature_access
-from app.services.llm import (
-    TextChunkCallback,
-    best_existing_topic_match,
-    get_chat_llm_client,
-    get_topic_llm_client,
-    update_conversation_summary,
+from app.services.chat_usage import release_daily_message, reserve_daily_message
+from app.llm.tasks.conversation_summary import update_conversation_summary
+from app.llm.providers.factory import get_chat_llm_client, get_topic_llm_client
+from app.llm.types import TextChunkCallback
+from app.llm.tasks.map_suggestions import (
+    remember_map_suggestion_event,
+    should_surface_map_suggestion,
 )
-from app.services.pattern_recognition import ChatAnalyser
+from app.llm.tasks.pattern_recognition import ChatAnalyser
 from app.services.self_authorship import (
     add_map_entry,
     create_or_link_topic_space,
@@ -47,6 +49,7 @@ from app.services.self_authorship import (
     record_conversation_memory,
     update_topic_space,
 )
+from app.llm.tasks.topic_matching import best_existing_topic_match
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -59,120 +62,10 @@ GENERIC_TOPIC_TITLES = {
     "mood",
     "feelings",
 }
-MAP_SUGGESTION_LONG_MESSAGE_CHARS = 140
-MAP_SUGGESTION_LONG_MESSAGE_WORDS = 35
-MAP_SUGGESTION_SMALL_MESSAGE_TURNS = 3
-MAP_SUGGESTION_REPEAT_COOLDOWN_TURNS = 5
-MAP_SUGGESTION_HISTORY_KEYS = (
-    "last_surface_map_suggestion",
-    "last_saved_map_suggestion",
-    "last_dismissed_map_suggestion",
-)
-MAP_SUGGESTION_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 
 
 def current_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _message_date(value: Any) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date().isoformat()
-
-
-def saved_user_messages_for_date(db: Session, user_id: int, usage_date: str) -> int:
-    """Count saved messages when initializing quotas for existing installations."""
-
-    chat_infos = db.execute(
-        select(ChatSession.info).where(ChatSession.user_id == user_id)
-    ).scalars()
-    return sum(
-        1
-        for info in chat_infos
-        for message in (info or {}).get("messages", [])
-        if message.get("role") == "user"
-        and _message_date(message.get("created_at")) == usage_date
-    )
-
-
-def reserve_daily_message(
-    db: Session,
-    *,
-    user_id: int,
-    daily_limit: int,
-    premium_access: bool,
-) -> str | None:
-    """Reserve one persistent daily message slot and return its UTC date."""
-
-    if not settings.rate_limit_enabled or daily_limit <= 0:
-        return None
-
-    now = datetime.now(timezone.utc)
-    usage_date = now.date().isoformat()
-    usage = db.execute(
-        select(DailyLLMUsage).where(
-            DailyLLMUsage.user_id == user_id,
-            DailyLLMUsage.usage_date == usage_date,
-        )
-    ).scalar_one_or_none()
-    saved_count = saved_user_messages_for_date(db, user_id, usage_date)
-    used_messages = max(usage.message_count if usage else 0, saved_count)
-    if used_messages >= daily_limit:
-        tomorrow = datetime.combine(
-            now.date() + timedelta(days=1),
-            datetime.min.time(),
-            tzinfo=timezone.utc,
-        )
-        retry_after = max(1, int((tomorrow - now).total_seconds()))
-        detail = (
-            "Daily message limit reached. Please try again tomorrow."
-            if premium_access
-            else (
-                f"You have reached today's {daily_limit} free messages. "
-                "Subscribe to Premium for more messages, or continue tomorrow."
-            )
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=detail,
-            headers={"Retry-After": str(retry_after)},
-        )
-
-    if usage is None:
-        usage = DailyLLMUsage(
-            user_id=user_id,
-            usage_date=usage_date,
-            message_count=used_messages + 1,
-        )
-        db.add(usage)
-    else:
-        usage.message_count = used_messages + 1
-    db.commit()
-    return usage_date
-
-
-def release_daily_message(db: Session, *, user_id: int, usage_date: str | None) -> None:
-    """Return a reserved slot when no assistant response was saved."""
-
-    if usage_date is None:
-        return
-    db.rollback()
-    usage = db.execute(
-        select(DailyLLMUsage).where(
-            DailyLLMUsage.user_id == user_id,
-            DailyLLMUsage.usage_date == usage_date,
-        )
-    ).scalar_one_or_none()
-    if usage is not None and usage.message_count > 0:
-        usage.message_count -= 1
-        db.commit()
 
 
 def is_generic_topic(topic: Any) -> bool:
@@ -215,119 +108,6 @@ def set_pending_topic_queue(
     chat_info.pop("pending_topics", None)
     chat_info.pop("pending_topic", None)
     chat_info["analysis_status"] = "idle"
-
-
-def normalized_map_suggestion_text(value: Any) -> str:
-    return " ".join(str(value or "").strip().lower().split())
-
-
-def map_suggestion_tokens(value: Any) -> set[str]:
-    return {
-        token
-        for token in MAP_SUGGESTION_TOKEN_PATTERN.findall(normalized_map_suggestion_text(value))
-        if len(token) > 3
-    }
-
-
-def map_suggestion_signature(suggestion: dict[str, Any] | None) -> str:
-    if not isinstance(suggestion, dict):
-        return ""
-    category = str(suggestion.get("category") or "").strip().lower()
-    text = normalized_map_suggestion_text(suggestion.get("text"))
-    return f"{category}:{text[:220]}"
-
-
-def map_suggestions_are_similar(
-    first: dict[str, Any] | None,
-    second: dict[str, Any] | None,
-) -> bool:
-    if not isinstance(first, dict) or not isinstance(second, dict):
-        return False
-    if str(first.get("category") or "").lower() != str(second.get("category") or "").lower():
-        return False
-
-    first_text = normalized_map_suggestion_text(first.get("text"))
-    second_text = normalized_map_suggestion_text(second.get("text"))
-    if not first_text or not second_text:
-        return False
-    if first_text == second_text or first_text in second_text or second_text in first_text:
-        return True
-
-    first_tokens = map_suggestion_tokens(first_text)
-    second_tokens = map_suggestion_tokens(second_text)
-    if min(len(first_tokens), len(second_tokens)) < 3:
-        return False
-    overlap = len(first_tokens & second_tokens) / min(len(first_tokens), len(second_tokens))
-    return overlap >= 0.7
-
-
-def map_suggestion_marker(
-    suggestion: dict[str, Any],
-    *,
-    message_count: int,
-) -> dict[str, Any]:
-    return {
-        "category": suggestion.get("category"),
-        "text": normalized_map_suggestion_text(suggestion.get("text"))[:220],
-        "signature": map_suggestion_signature(suggestion),
-        "message_count": message_count,
-        "created_at": current_timestamp(),
-    }
-
-
-def map_suggestion_from_marker(marker: Any) -> dict[str, Any] | None:
-    if not isinstance(marker, dict):
-        return None
-    return {
-        "category": marker.get("category"),
-        "text": marker.get("text"),
-    }
-
-
-def should_surface_map_suggestion(
-    chat_info: dict[str, Any],
-    user_input: str,
-    suggestion: dict[str, Any] | None,
-) -> bool:
-    if not suggestion:
-        return False
-
-    next_message_count = int((chat_info or {}).get("message_count", 0)) + 1
-    for key in MAP_SUGGESTION_HISTORY_KEYS:
-        marker = (chat_info or {}).get(key)
-        if not isinstance(marker, dict):
-            continue
-        marker_count = int(marker.get("message_count", 0))
-        if next_message_count - marker_count >= MAP_SUGGESTION_REPEAT_COOLDOWN_TURNS:
-            continue
-        if map_suggestions_are_similar(suggestion, map_suggestion_from_marker(marker)):
-            return False
-
-    stripped_input = user_input.strip()
-    if (
-        len(stripped_input) >= MAP_SUGGESTION_LONG_MESSAGE_CHARS
-        or len(stripped_input.split()) >= MAP_SUGGESTION_LONG_MESSAGE_WORDS
-    ):
-        return True
-
-    last_surface = (chat_info or {}).get("last_surface_map_suggestion")
-    last_surface_count = (
-        int(last_surface.get("message_count", 0)) if isinstance(last_surface, dict) else 0
-    )
-    return next_message_count - last_surface_count >= MAP_SUGGESTION_SMALL_MESSAGE_TURNS
-
-
-def remember_map_suggestion_event(
-    chat_info: dict[str, Any],
-    key: str,
-    suggestion: dict[str, Any],
-) -> dict[str, Any]:
-    next_info = dict(chat_info)
-    next_info[key] = map_suggestion_marker(
-        suggestion,
-        message_count=int(next_info.get("message_count", 0)),
-    )
-    return next_info
 
 
 def default_chat_info(user_id: int, chat_id: str, title: str | None = None) -> dict[str, Any]:
@@ -449,12 +229,7 @@ def append_chat_exchange(
     next_info["last_user_message"] = user_input
     next_info["last_assistant_message"] = assistant_message
     next_info["updated_at"] = now
-    pending_topic = next_info.get("pending_topic")
-    next_info["analysis_status"] = (
-        "topic_ready"
-        if isinstance(pending_topic, dict) and pending_topic.get("status") == "pending"
-        else "queued"
-    )
+    next_info["analysis_status"] = "queued"
     if map_suggestion:
         next_info["pending_map_suggestion"] = map_suggestion
     else:
@@ -481,14 +256,12 @@ async def analyse_chat_for_topic(
         info = dict(chat_session.info or {})
         queued_topics = pending_topic_queue(info)
         replaced_generic_topic = False
-        if queued_topics:
-            return
         raw_pending_topic = info.get("pending_topic")
         raw_pending_topics = info.get("pending_topics")
-        if (
-            isinstance(raw_pending_topic, dict)
-            and raw_pending_topic.get("status") == "pending"
-        ) or isinstance(raw_pending_topics, list):
+        if not queued_topics and (
+            (isinstance(raw_pending_topic, dict) and raw_pending_topic.get("status") == "pending")
+            or isinstance(raw_pending_topics, list)
+        ):
             set_pending_topic_queue(info, [])
             replaced_generic_topic = True
 
@@ -500,6 +273,7 @@ async def analyse_chat_for_topic(
             return
 
         info["analysis_status"] = "analysing"
+        info.pop("analysis_error", None)
         chat_session.info = info
         db.commit()
 
@@ -507,13 +281,8 @@ async def analyse_chat_for_topic(
         info = dict(chat_session.info or {})
         info["analysed_message_count"] = message_count
 
-        if not analysis.should_create_topic:
-            info["analysis_status"] = "idle"
-            chat_session.info = info
-            db.commit()
-            return
-
         user = db.get(User, user_id)
+        premium_access = user is not None and has_premium_feature_access(db, user)
         profile = db.scalar(select(UserProfile).where(UserProfile.user_id == user_id))
         visible_map = (
             read_map(profile.data if profile else {})
@@ -527,20 +296,73 @@ async def analyse_chat_for_topic(
                 "category": space.get("category", "other"),
                 "description": space.get("description", ""),
                 "parent_topic_id": space.get("parent_topic_id"),
+                "observations": [
+                    {"category": entry.get("category"), "text": str(entry.get("text") or "")[:240]}
+                    for entry in space.get("entries", [])[-5:]
+                ],
             }
             for space in visible_map.get("topic_spaces", [])[:40]
         ]
         topic_result = await get_topic_llm_client().create_topic(
-            chat_info=info,
+            chat_info={
+                **info,
+                "suggest_topics": not queued_topics,
+                "suggest_observations": premium_access and not info.get("pending_map_suggestion"),
+            },
             matched_patterns=analysis.matched_patterns,
             topic_hint=analysis.topic_hint,
             available_topics=available_topics,
         )
+        # A newer exchange or review may have arrived during generation.
+        db.refresh(chat_session)
+        info = dict(chat_session.info or {})
+        if int(info.get("message_count", 0)) != message_count:
+            return
+        info["analysed_message_count"] = message_count
+        queued_topics = pending_topic_queue(info)
+        if (
+            premium_access
+            and topic_result.map_suggestion
+            and not info.get("pending_map_suggestion")
+        ):
+            newest_input = next(
+                (
+                    str(m.get("content") or "")
+                    for m in reversed(info.get("messages", []))
+                    if m.get("role") == "user"
+                ),
+                "",
+            )
+            suggestion = dict(topic_result.map_suggestion)
+            target = next(
+                (
+                    space
+                    for space in visible_map.get("topic_spaces", [])
+                    if space.get("id") == topic_result.existing_topic_id
+                ),
+                None,
+            )
+            if target is None:
+                target = find_topic_space_for_chat(profile.data if profile else {}, chat_id)
+            suggestion.update(
+                source_chat_id=chat_id,
+                topic_space_id=target.get("id") if target else None,
+                topic_title=target.get("title") if target else None,
+            )
+            policy_info = {**info, "message_count": message_count - 1}
+            if should_surface_map_suggestion(policy_info, newest_input, suggestion):
+                info["pending_map_suggestion"] = suggestion
+                info = remember_map_suggestion_event(
+                    info, "last_surface_map_suggestion", suggestion
+                )
+        if queued_topics:
+            info["analysis_status"] = "topic_ready" if queued_topics else "idle"
+            chat_session.info = info
+            db.commit()
+            return
         available_topic_ids = {topic.get("id") for topic in available_topics}
         accepted_topic_names = {
-            normalized_topic(topic)
-            for topic in info.get("accepted_topic_names", [])
-            if topic
+            normalized_topic(topic) for topic in info.get("accepted_topic_names", []) if topic
         }
         pending_topics: list[dict[str, Any]] = []
         seen_targets: set[tuple[str, str]] = set()
@@ -594,7 +416,8 @@ async def analyse_chat_for_topic(
                     "description": result.description,
                     "category": result.category,
                     "related_topic_ids": [
-                        topic_id for topic_id in result.related_topic_ids
+                        topic_id
+                        for topic_id in result.related_topic_ids
                         if topic_id in available_topic_ids and topic_id != result.existing_topic_id
                     ],
                     "confidence": analysis.confidence,
@@ -617,9 +440,8 @@ async def analyse_chat_for_topic(
             # Keep deliberately supplied and already-established chat names stable.
             # For a new automatic chat, the first strong topic is a better title
             # than the opening message excerpt. Later analyses must not rename it.
-            can_use_initial_topic = (
-                info.get("title_source") != "provided"
-                and not info.get("accepted_topic_names")
+            can_use_initial_topic = info.get("title_source") != "provided" and not info.get(
+                "accepted_topic_names"
             )
             if can_use_initial_topic:
                 initial_topic_title = str(pending_topics[0].get("topic") or "").strip()
@@ -632,6 +454,12 @@ async def analyse_chat_for_topic(
         chat_session.info = info
         db.commit()
     except Exception as exc:  # pragma: no cover - defensive for background jobs
+        logger.warning(
+            "Background map analysis failed: provider=%s status=%s error_type=%s",
+            settings.topic_llm_provider or settings.llm_provider,
+            getattr(exc, "status_code", None),
+            type(exc).__name__,
+        )
         db.rollback()
         chat_session = db.execute(
             select(ChatSession).where(
@@ -669,8 +497,7 @@ def list_chats(
         .order_by(ChatSession.updated_at.desc())
     ).scalars()
     return [
-        chat_read(chat_session, premium_access=premium_access)
-        for chat_session in chat_sessions
+        chat_read(chat_session, premium_access=premium_access) for chat_session in chat_sessions
     ]
 
 
@@ -704,6 +531,36 @@ def read_chat(
     )
 
 
+@router.put("/chats/{chat_id}/reaction")
+def react_to_reply(
+    chat_id: str,
+    payload: ReplyReactionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    chat = get_chat_session(db, current_user, chat_id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    info = dict(chat.info or {})
+    messages = [dict(message) for message in info.get("messages", [])]
+    target = next(
+        (
+            message
+            for message in messages
+            if message.get("role") == "assistant"
+            and message.get("created_at") == payload.created_at
+        ),
+        None,
+    )
+    if target is None:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    target["reaction"] = payload.reaction
+    info["messages"] = messages
+    chat.info = info
+    db.commit()
+    return {"reaction": payload.reaction}
+
+
 @router.delete("/chats/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_chat(
     chat_id: str,
@@ -732,7 +589,37 @@ def read_topic_suggestion(
         suggestion=suggestions[0] if suggestions else None,
         suggestions=suggestions,
         chat_title=str((chat_session.info or {}).get("title") or "New chat"),
+        map_suggestion=(
+            (chat_session.info or {}).get("pending_map_suggestion")
+            if has_premium_feature_access(db, current_user)
+            else None
+        ),
+        analysis_status=str((chat_session.info or {}).get("analysis_status") or "idle"),
     )
+
+
+@router.post("/chats/{chat_id}/topic-suggestion/retry", status_code=202)
+def retry_topic_suggestion(
+    chat_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    chat_session = get_chat_session(db, current_user, chat_id)
+    if chat_session is None:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    info = dict(chat_session.info or {})
+    if info.get("analysis_status") != "error":
+        return {"analysis_status": str(info.get("analysis_status") or "idle")}
+    enforce_rate_limit(f"map-retry:{current_user.id}", max_attempts=3, window_seconds=60)
+    info["analysis_status"] = "queued"
+    info.pop("analysed_message_count", None)
+    info.pop("analysis_error", None)
+    chat_session.info = info
+    db.commit()
+    factory = sessionmaker(autocommit=False, autoflush=False, bind=db.get_bind())
+    background_tasks.add_task(maintain_chat_insights, current_user.id, chat_id, factory)
+    return {"analysis_status": "queued"}
 
 
 @router.post("/message", response_model=LLMResponse)
@@ -795,7 +682,8 @@ async def process_llm_message(
                 **chat_request,
                 on_text_chunk=on_text_chunk,
             )
-    except Exception:
+    except (Exception, asyncio.CancelledError):
+        db.rollback()
         release_daily_message(
             db,
             user_id=current_user.id,
@@ -803,28 +691,18 @@ async def process_llm_message(
         )
         raise
 
+    # Generation may take minutes. Map edits committed during that wait must
+    # survive the conversation-memory update below.
+    db.refresh(profile)
     profile.data = record_conversation_memory(
         merge_llm_profile(profile.data, chat_result.profile),
         user_input=payload.input_text,
         chat_id=chat_session.chat_id,
     )
 
-    raw_map_suggestion = None
-    if premium_access and chat_result.map_suggestion:
-        topic_space = find_topic_space_for_chat(profile.data, chat_session.chat_id)
-        raw_map_suggestion = {
-            **chat_result.map_suggestion,
-            "source_chat_id": chat_session.chat_id,
-            "topic_space_id": topic_space.get("id") if topic_space else None,
-            "topic_title": topic_space.get("title") if topic_space else None,
-        }
-
+    db.refresh(chat_session)
     base_chat_info = chat_session.info or {}
-    map_suggestion = (
-        raw_map_suggestion
-        if should_surface_map_suggestion(base_chat_info, payload.input_text, raw_map_suggestion)
-        else None
-    )
+    map_suggestion = base_chat_info.get("pending_map_suggestion") if premium_access else None
     next_chat_info = append_chat_exchange(
         chat_session.info or {},
         user_id=current_user.id,
@@ -834,12 +712,6 @@ async def process_llm_message(
         map_suggestion=map_suggestion,
     )
     next_chat_info = update_conversation_summary(next_chat_info)
-    if map_suggestion:
-        next_chat_info = remember_map_suggestion_event(
-            next_chat_info,
-            "last_surface_map_suggestion",
-            map_suggestion,
-        )
     chat_session.info = next_chat_info
     db.commit()
     db.refresh(profile)
@@ -933,13 +805,18 @@ async def stream_message_to_llm(
                     yield json.dumps(
                         {
                             "type": "status",
-                            "message": "Ollama is generating locally",
+                            "message": "FeelY - reflecting ...",
                             "elapsed_seconds": elapsed,
                         }
                     ) + "\n"
             result = await task
             yield json.dumps({"type": "result", "data": result.model_dump(mode="json")}) + "\n"
         except HTTPException as exc:
+            logger.warning(
+                "Chat stream failed: status=%s provider=%s",
+                exc.status_code,
+                settings.chat_llm_provider or settings.llm_provider,
+            )
             stream_db.rollback()
             yield json.dumps(
                 {"type": "error", "message": str(exc.detail), "status": exc.status_code}
@@ -956,6 +833,10 @@ async def stream_message_to_llm(
         finally:
             if not task.done():
                 task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
             stream_db.close()
 
     return StreamingResponse(
@@ -982,14 +863,36 @@ def confirm_topic(
     chat_info = dict(chat_session.info or {})
     queued_topics = pending_topic_queue(chat_info)
 
+    if payload.suggestion_id and not any(
+        item.get("suggestion_id") == payload.suggestion_id for item in queued_topics
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="This suggestion was already reviewed or replaced. Refresh the chat.",
+        )
+    if (
+        payload.accepted
+        and (payload.require_map_access or payload.existing_topic_space_id)
+        and not premium_access
+    ):
+        raise HTTPException(status_code=402, detail="My Map access is required to add to a topic.")
+
     if payload.accepted:
         accepted_topic_name = payload.topic
         if premium_access:
-            if payload.existing_topic_space_id:
+            existing_id = payload.existing_topic_space_id or next(
+                (
+                    space["id"]
+                    for space in read_map(profile_data)["topic_spaces"]
+                    if space["title"].strip().casefold() == payload.topic.casefold()
+                ),
+                None,
+            )
+            if existing_id:
                 try:
                     profile_data, topic_space = link_chat_to_topic_space(
                         profile_data,
-                        topic_space_id=payload.existing_topic_space_id,
+                        topic_space_id=existing_id,
                         chat_id=payload.chat_id,
                     )
                 except LookupError as exc:
@@ -1014,19 +917,40 @@ def confirm_topic(
                         detail=str(exc),
                     ) from exc
 
-            if payload.existing_topic_space_id and (
+            if existing_id and (
                 payload.related_topic_ids or "category" in payload.model_fields_set
             ):
                 try:
                     profile_data, topic_space = update_topic_space(
-                        profile_data, topic_space_id=topic_space["id"],
-                        category=payload.category if "category" in payload.model_fields_set else None,
-                        related_topic_ids=list(dict.fromkeys([
-                            *topic_space.get("related_topic_ids", []), *payload.related_topic_ids,
-                        ])), update_related=True,
+                        profile_data,
+                        topic_space_id=topic_space["id"],
+                        category=(
+                            payload.category if "category" in payload.model_fields_set else None
+                        ),
+                        related_topic_ids=list(
+                            dict.fromkeys(
+                                [
+                                    *topic_space.get("related_topic_ids", []),
+                                    *payload.related_topic_ids,
+                                ]
+                            )
+                        ),
+                        update_related=True,
                     )
                 except (LookupError, ValueError) as exc:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                    ) from exc
+
+            if existing_id:
+                profile_data, _ = add_map_entry(
+                    profile_data,
+                    category=payload.entry_category,
+                    text=payload.description,
+                    topic_space_id=topic_space["id"],
+                    source_chat_id=payload.chat_id,
+                    reason=f"Saved from topic suggestion: {payload.topic}",
+                )
 
             topics = list(profile_data.get("topics", []))
             topic_entry = {
@@ -1051,9 +975,8 @@ def confirm_topic(
             if not chat_info.get("topic_space_id"):
                 chat_info["topic_space_id"] = topic_space["id"]
             pending_map_suggestion = chat_info.get("pending_map_suggestion")
-            if (
-                isinstance(pending_map_suggestion, dict)
-                and not pending_map_suggestion.get("topic_space_id")
+            if isinstance(pending_map_suggestion, dict) and not pending_map_suggestion.get(
+                "topic_space_id"
             ):
                 pending_map_suggestion["topic_space_id"] = topic_space["id"]
                 pending_map_suggestion["topic_title"] = topic_space["title"]
@@ -1063,7 +986,12 @@ def confirm_topic(
             accepted_topic_names.append(accepted_topic_name)
         chat_info["accepted_topic_names"] = accepted_topic_names
     if queued_topics:
-        set_pending_topic_queue(chat_info, queued_topics[1:])
+        remaining = (
+            [item for item in queued_topics if item.get("suggestion_id") != payload.suggestion_id]
+            if payload.suggestion_id
+            else queued_topics[1:]
+        )
+        set_pending_topic_queue(chat_info, remaining)
     else:
         set_pending_topic_queue(chat_info, [])
     chat_info["updated_at"] = current_timestamp()
@@ -1073,6 +1001,7 @@ def confirm_topic(
 
     return TopicConfirmationResponse(
         accepted=payload.accepted,
+        saved_topic_space_id=topic_space["id"] if payload.accepted and premium_access else None,
         profile=profile_data_for_access(
             profile.data,
             premium_access=premium_access,
@@ -1120,10 +1049,14 @@ def confirm_map_suggestion(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         profile.data = profile_data
 
-    suggestion_event = pending_map_suggestion if isinstance(pending_map_suggestion, dict) else {
-        "category": payload.category,
-        "text": payload.text,
-    }
+    suggestion_event = (
+        pending_map_suggestion
+        if isinstance(pending_map_suggestion, dict)
+        else {
+            "category": payload.category,
+            "text": payload.text,
+        }
+    )
     chat_info = remember_map_suggestion_event(
         chat_info,
         "last_saved_map_suggestion" if payload.accepted else "last_dismissed_map_suggestion",

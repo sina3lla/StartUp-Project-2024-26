@@ -17,14 +17,15 @@ from app.schemas.journal import (
     JournalSuggestionDecision,
     JournalSuggestionDecisionResponse,
 )
-from app.services.llm import analyse_journal_text
 from app.services.billing import has_premium_feature_access
+from app.llm.tasks.journal import analyse_journal_text
 from app.services.self_authorship import (
     ENTRY_CATEGORIES,
     add_map_entry,
     create_topic_space,
     link_journal_to_topic_space,
     read_map,
+    update_topic_space,
 )
 
 router = APIRouter()
@@ -224,7 +225,9 @@ def decide_journal_suggestion(
     if suggestion is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Suggestion not found")
     if suggestion.get("status") != "pending":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Suggestion was already reviewed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Suggestion was already reviewed"
+        )
 
     if not payload.accepted:
         suggestion["status"] = "dismissed"
@@ -233,14 +236,38 @@ def decide_journal_suggestion(
         if suggestion.get("kind") == "topic":
             title = (payload.title or suggestion.get("title") or "").strip()
             description = (payload.text or suggestion.get("text") or "").strip()
-            if not payload.topic_space_id and (not title or not description):
-                raise HTTPException(status_code=422, detail="Topic title and description are required")
+            if not title or not description:
+                raise HTTPException(
+                    status_code=422, detail="Topic title and description are required"
+                )
+            existing_id = payload.topic_space_id or next(
+                (
+                    space["id"]
+                    for space in read_map(profile.data)["topic_spaces"]
+                    if space["title"].strip().casefold() == title.casefold()
+                ),
+                None,
+            )
             try:
-                if payload.topic_space_id:
+                if existing_id:
                     profile_data, saved_item = link_journal_to_topic_space(
                         profile.data,
-                        topic_space_id=payload.topic_space_id,
+                        topic_space_id=existing_id,
                         journal_date=normalized_date,
+                    )
+                    if payload.topic_category is not None:
+                        profile_data, saved_item = update_topic_space(
+                            profile_data,
+                            topic_space_id=saved_item["id"],
+                            category=payload.topic_category,
+                        )
+                    profile_data, _ = add_map_entry(
+                        profile_data,
+                        category=payload.category or "own_perception",
+                        text=description,
+                        topic_space_id=saved_item["id"],
+                        source_journal_date=normalized_date,
+                        reason=f"Saved from topic suggestion: {title}",
                     )
                 else:
                     profile_data, saved_item = create_topic_space(
@@ -252,11 +279,15 @@ def decide_journal_suggestion(
                     )
             except LookupError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         else:
             category = payload.category or suggestion.get("category")
             text = (payload.text or suggestion.get("text") or "").strip()
             if category not in ENTRY_CATEGORIES or not text:
-                raise HTTPException(status_code=422, detail="A valid map category and text are required")
+                raise HTTPException(
+                    status_code=422, detail="A valid map category and text are required"
+                )
             try:
                 profile_data, saved_item = add_map_entry(
                     profile.data,

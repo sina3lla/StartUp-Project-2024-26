@@ -68,12 +68,22 @@ class Settings(BaseSettings):
     turnstile_action: str = "register"
     turnstile_verify_url: str = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
     turnstile_timeout_seconds: float = 5.0
-    google_auth_enabled: bool = False
-    google_client_id: str | None = None
-    google_allowed_hosted_domain: str | None = None
+    android_app_enabled: bool = False
+    android_package_name: str = ""
+    terms_version: str = Field(default="", max_length=80)
+    terms_document_url: str = ""
+    terms_document_sha256: str = Field(default="", pattern=r"^$|^[a-f0-9]{64}$")
     email_verification_enabled: bool = False
     email_verification_required: bool = False
     email_verification_token_expire_hours: int = 24
+    email_verification_pin_expire_minutes: int = Field(default=15, ge=1, le=60)
+    email_verification_max_attempts: int = Field(default=5, ge=1, le=10)
+    feedback_enabled: bool = False
+    feedback_email_to: str | None = None
+    webmail_enabled: bool = False
+    webmail_address: str = "info@feel-y.com"
+    webmail_worker_url: str = ""
+    webmail_bridge_secret: str = ""
     password_reset_enabled: bool = False
     password_reset_token_expire_minutes: int = 60
     public_app_url: str = "http://127.0.0.1:5500"
@@ -83,6 +93,7 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_from_email: str | None = None
     smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
 
     stripe_enabled: bool = False
     stripe_secret_key: str | None = None
@@ -115,12 +126,13 @@ class Settings(BaseSettings):
     ollama_topic_model: str | None = None
     ollama_journal_model: str | None = None
     ollama_timeout_seconds: float = 180.0
-    ollama_context_window: int = 2048
-    ollama_chat_max_tokens: int = 160
-    ollama_topic_max_tokens: int = 256
+    ollama_context_window: int = 8192
+    ollama_chat_temperature: float = Field(default=0.3, ge=0, le=2)
+    ollama_chat_max_tokens: int = 1536
+    ollama_topic_max_tokens: int = 768
     ollama_journal_max_tokens: int = 768
     ollama_chat_num_gpu: int = 0
-    ollama_topic_num_gpu: int = 999
+    ollama_topic_num_gpu: int = 0
     ollama_journal_num_gpu: int | None = None
     ollama_keep_alive: int = 300
     ollama_prewarm: bool = False
@@ -134,12 +146,16 @@ class Settings(BaseSettings):
 
     def validate_runtime_security(self) -> None:
         if self.secret_key == "change-this-secret-before-deploying" or len(self.secret_key) < 32:
-            raise RuntimeError("SECRET_KEY must be a unique random value of at least 32 characters.")
+            raise RuntimeError(
+                "SECRET_KEY must be a unique random value of at least 32 characters."
+            )
         if self.is_local_environment:
             return
 
         if self.secret_key == "change-this-secret-before-deploying" or len(self.secret_key) < 32:
-            raise RuntimeError("SECRET_KEY must be changed to a long random value before deployment.")
+            raise RuntimeError(
+                "SECRET_KEY must be changed to a long random value before deployment."
+            )
 
         unsafe_origins = {"*", "null"} & set(self.cors_origins)
         if unsafe_origins:
@@ -159,14 +175,14 @@ class Settings(BaseSettings):
             raise RuntimeError("Cloudflare Turnstile test keys cannot be used in production.")
         if not self.turnstile_action.strip():
             raise RuntimeError("TURNSTILE_ACTION must be configured.")
-        if self.google_auth_enabled and not self.google_client_id:
-            raise RuntimeError("GOOGLE_CLIENT_ID must be configured when Google auth is enabled.")
         if self.email_verification_required and not self.email_verification_enabled:
             raise RuntimeError(
                 "EMAIL_VERIFICATION_ENABLED must be true when email verification is required."
             )
         if self.email_verification_enabled and not self.email_delivery_configured:
-            raise RuntimeError("SMTP settings must be configured when email verification is enabled.")
+            raise RuntimeError(
+                "SMTP settings must be configured when email verification is enabled."
+            )
         if self.password_reset_enabled and not self.email_delivery_configured:
             raise RuntimeError("SMTP settings must be configured when password reset is enabled.")
 

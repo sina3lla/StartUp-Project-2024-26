@@ -1,11 +1,32 @@
+from pathlib import Path
+
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+
+from app.core.config import settings
 from app.db.base import Base
 from app.db.session import engine
-from app.models import billing, user  # noqa: F401
+from app.models import billing, feedback, mail_message, terms, user  # noqa: F401
 
 
 def init_db() -> None:
+    if engine.dialect.name != "sqlite" or not settings.is_local_environment:
+        require_migrated_schema()
+        return
     Base.metadata.create_all(bind=engine)
     ensure_sqlite_user_columns()
+
+
+def require_migrated_schema() -> None:
+    """Startup verifies migrations; it never applies production DDL."""
+    root = Path(__file__).resolve().parents[2]
+    config = Config(str(root / "alembic.ini"))
+    scripts = ScriptDirectory.from_config(config)
+    with engine.connect() as connection:
+        current = set(MigrationContext.configure(connection).get_current_heads())
+    if current != set(scripts.get_heads()):
+        raise RuntimeError("Database schema is not at Alembic head. Run alembic upgrade head.")
 
 
 def ensure_sqlite_user_columns() -> None:
@@ -18,11 +39,11 @@ def ensure_sqlite_user_columns() -> None:
         "bio": "VARCHAR(500)",
         "avatar_url": "VARCHAR(500)",
         "auth_provider": "VARCHAR(40) NOT NULL DEFAULT 'password'",
-        "google_sub": "VARCHAR(255)",
         "is_email_verified": "BOOLEAN NOT NULL DEFAULT 0",
         "email_verified_at": "DATETIME",
         "email_verification_token_hash": "VARCHAR(128)",
         "email_verification_sent_at": "DATETIME",
+        "email_verification_attempts": "INTEGER NOT NULL DEFAULT 0",
         "password_reset_token_hash": "VARCHAR(128)",
         "password_reset_sent_at": "DATETIME",
         "last_login_at": "DATETIME",
@@ -40,9 +61,6 @@ def ensure_sqlite_user_columns() -> None:
                 connection.exec_driver_sql(
                     f"ALTER TABLE users ADD COLUMN {column_name} {definition}"
                 )
-        connection.exec_driver_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_google_sub ON users (google_sub)"
-        )
         connection.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email_verification_token_hash "
             "ON users (email_verification_token_hash)"

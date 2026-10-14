@@ -46,6 +46,7 @@ def rate_limit_auth(request: Request) -> None:
 
 
 def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
@@ -70,6 +71,33 @@ def get_current_user(
     if user is None or not user.is_active:
         raise credentials_error
 
+    if (
+        settings.email_verification_enabled or settings.email_verification_required
+    ) and not user.is_email_verified:
+        raise HTTPException(status_code=403, detail="Please verify your email before logging in.")
+
+    # Account management and terms remain accessible if a user declines new terms.
+    from app.services.terms import has_accepted_current, terms_config
+
+    current_terms = terms_config()
+    path = request.url.path.removeprefix(settings.api_v1_prefix).rstrip("/")
+    exempt = path in {
+        "/terms/me",
+        "/terms/accept",
+        "/users/me",
+        "/users/me/account",
+        "/users/me/password",
+        "/billing/subscription",
+        "/billing/portal",
+    }
+    if (
+        current_terms["enforced"]
+        and not exempt
+        and not has_accepted_current(db, user.id, current_terms)
+    ):
+        raise HTTPException(
+            status_code=423, detail="Please accept the current FeelY AGB before continuing."
+        )
     return user
 
 
@@ -84,14 +112,6 @@ def get_current_premium_user(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Premium is required to access My Map.",
         )
-    return current_user
-
-
-def get_current_map_debug_user(
-    current_user: User = Depends(get_current_premium_user),
-) -> User:
-    if current_user.role not in ("admin", "test"):
-        raise HTTPException(status_code=403, detail="Map debug tools require an admin or test account.")
     return current_user
 
 

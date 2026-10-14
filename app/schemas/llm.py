@@ -1,8 +1,8 @@
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.schemas.profile import TopicCategory
+from app.schemas.profile import MapEntryCategory, TopicCategory
 
 
 class LLMRequest(BaseModel):
@@ -62,12 +62,17 @@ class LLMResponse(BaseModel):
 
 
 class TopicSuggestionResponse(BaseModel):
+    map_suggestion: dict[str, Any] | None = None
+    analysis_status: str = "idle"
     suggestion: TopicSuggestion | None = None
     suggestions: list[TopicSuggestion] = Field(default_factory=list)
     chat_title: str | None = None
 
 
 class TopicConfirmationRequest(BaseModel):
+    require_map_access: bool = False
+    suggestion_id: str | None = Field(default=None, max_length=64)
+    entry_category: MapEntryCategory = "own_perception"
     category: TopicCategory = "other"
     related_topic_ids: list[str] = Field(default_factory=list, max_length=24)
     chat_id: str = Field(min_length=1, max_length=120)
@@ -77,10 +82,16 @@ class TopicConfirmationRequest(BaseModel):
     existing_topic_space_id: str | None = Field(default=None, max_length=64)
     parent_topic_space_id: str | None = Field(default=None, max_length=64)
 
+    @field_validator("topic", "description", mode="before")
+    @classmethod
+    def trim_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
 
 class TopicConfirmationResponse(BaseModel):
     accepted: bool
     profile: dict[str, Any]
+    saved_topic_space_id: str | None = None
 
 
 class MapSuggestionConfirmationRequest(BaseModel):
@@ -96,3 +107,8 @@ class MapSuggestionConfirmationResponse(BaseModel):
     accepted: bool
     entry: dict[str, Any] | None = None
     map: dict[str, Any]
+
+
+class ReplyReactionRequest(BaseModel):
+    created_at: str = Field(min_length=1, max_length=64)
+    reaction: Literal["like", "dislike"] | None = None

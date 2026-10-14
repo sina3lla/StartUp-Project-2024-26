@@ -35,9 +35,8 @@ User password resets do not revoke already-issued user JWTs; those remain valid 
 expiration. Disabling the user invalidates their authenticated API access immediately because
 each request reloads the user and checks `is_active`.
 
-Member accounts cannot see or call the map debug preview/apply tool. Test and Admin accounts
-can use it when they have Premium map access. Test accounts cannot use administration;
-Admin accounts can manage users and prompts. Changing roles does not change subscriptions.
+Member and Test accounts cannot use administration. Admin accounts can manage
+users and prompts. Changing roles does not change subscriptions.
 Roles are only writable through admin endpoints. Revoking the Admin role or disabling the
 account immediately invalidates that account's admin access, including existing admin tokens.
 The configured administrator login remains independent and can restore access.
@@ -59,6 +58,7 @@ appropriate UTF-8 file for every model request, so a saved edit is active on the
 without restarting FastAPI or Ollama.
 
 These files are the only source of truth for the model instructions. Prompt text is not duplicated
-in `app/services/llm.py`. If a file is missing or empty, model requests fail with a prompt
+in Python code. Loading and saving live in `app/llm/prompts.py`.
+If a file is missing or empty, model requests fail with a prompt
 configuration error; the admin editor shows an empty field so an administrator can restore and
 save the prompt.

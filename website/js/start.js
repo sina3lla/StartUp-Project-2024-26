@@ -3,6 +3,9 @@
 loginTab.addEventListener("click", () => setMode("login"));
 registerTab.addEventListener("click", () => setMode("register"));
 forgotPasswordButton.addEventListener("click", openPasswordResetRequest);
+activateAccountButton.addEventListener("click", () => openEmailVerification());
+verificationForm.addEventListener("submit", confirmEmailPin);
+verificationResend.addEventListener("click", resendEmailPin);
 passwordResetRequestForm.addEventListener("submit", (event) =>
   requestPasswordReset(event).catch((error) => {
     passwordResetStatus.textContent = error instanceof Error ? error.message : String(error);
@@ -77,6 +80,13 @@ topicCategory.addEventListener("change", () => {
   if (state.pendingTopic) state.pendingTopic.category = topicCategory.value;
 });
 topicAccept.addEventListener("click", () => confirmTopic(true).catch(renderInlineError));
+for (const kind of ["topic", "map-suggestion"]) {
+  const review = document.querySelector(`#${kind}-review`);
+  const dialog = document.querySelector(`#${kind}-review-dialog`);
+  review.addEventListener("click", () => dialog.showModal());
+  dialog.querySelector("[data-close-chat-review]").addEventListener("click", () => dialog.close());
+}
+
 topicDismiss.addEventListener("click", () => confirmTopic(false).catch(renderInlineError));
 topicTarget.addEventListener("change", () => {
   updateTopicRoutePresentation();
@@ -92,7 +102,6 @@ mapSidebarAddTopic.addEventListener("click", () => {
   closeSidebar();
   openMapTopicPopup();
 });
-practiceForm.addEventListener("submit", (event) => createPractice(event).catch(renderInlineError));
 reflectionForm.addEventListener("submit", (event) =>
   completePractice(event).catch(renderInlineError),
 );
@@ -166,6 +175,7 @@ window.addEventListener("resize", () => {
 });
 window.addEventListener("orientationchange", syncViewportHeight);
 window.visualViewport?.addEventListener("resize", syncViewportHeight);
+window.visualViewport?.addEventListener("resize", autoresizeMessageInput);
 window.addEventListener("beforeunload", () => {
   if (state.journalDirty) saveJournalEntry({ keepalive: true });
 });
@@ -196,8 +206,9 @@ document.querySelectorAll("[data-lens]").forEach((button) => {
   });
 });
 messageInput.addEventListener("input", autoresizeMessageInput);
+document.querySelector("#map-analysis-retry").addEventListener("click", retryMapAnalysis);
 messageInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.isComposing && !state.chatRequest) {
     event.preventDefault();
     messageForm.requestSubmit();
   }
@@ -233,7 +244,7 @@ authForm.addEventListener("submit", async (event) => {
 async function init() {
   const savedToken = state.token;
   scheduleSessionExpiry();
-  await Promise.all([loadCaptchaConfig(), loadGoogleConfig()]);
+  await Promise.all([loadCaptchaConfig(), loadEmailConfig(), loadFeedbackConfig()]);
   const requestedMode = new URLSearchParams(window.location.search).get("mode");
   setMode(!savedToken && requestedMode === "register" ? "register" : "login");
   renderUser();
@@ -271,6 +282,7 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("resize", () => {
   clearTimeout(mapResizeTimer);
   mapResizeTimer = setTimeout(() => {
+    autoresizeMessageInput();
     if (!mapView.classList.contains("hidden")) renderMap();
   }, 120);
 });

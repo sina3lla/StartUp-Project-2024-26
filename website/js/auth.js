@@ -1,5 +1,67 @@
 // FeelY auth: see website/EDITING.md for file responsibilities and load order.
 
+async function loadEmailConfig() {
+  try {
+    const config = await api("/auth/email/config");
+    activateAccountButton.classList.toggle("hidden", !config.verification_enabled);
+  } catch {
+    // Keep login usable while the backend is temporarily unavailable.
+  }
+}
+
+function openEmailVerification(email = emailInput.value.trim(), message = "") {
+  verificationEmail.value = email.includes("@") ? email : "";
+  verificationPin.value = "";
+  verificationStatus.textContent = message;
+  verificationDialog.showModal();
+  (verificationEmail.value ? verificationPin : verificationEmail).focus();
+}
+
+async function confirmEmailPin(event) {
+  event.preventDefault();
+  const submit = verificationForm.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  verificationStatus.textContent = "Activating...";
+  try {
+    await api("/auth/email-verification/confirm", {
+      method: "POST",
+      body: JSON.stringify({ email: verificationEmail.value.trim(), pin: verificationPin.value.trim() }),
+    });
+    verificationPin.value = "";
+    verificationDialog.close();
+    if (state.token) {
+      await loadUser();
+      if (accountDialog.open) await openAccountDialog();
+    } else {
+      setMode("login");
+      emailInput.value = verificationEmail.value.trim();
+      authStatus.textContent = "Email activated. You can now log in.";
+      passwordInput.focus();
+    }
+  } catch (error) {
+    verificationStatus.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function resendEmailPin() {
+  if (!verificationEmail.reportValidity()) return;
+  verificationResend.disabled = true;
+  verificationStatus.textContent = "Sending a new PIN...";
+  try {
+    const response = await api("/auth/email-verification/request", {
+      method: "POST", body: JSON.stringify({ email: verificationEmail.value.trim() }),
+    });
+    verificationStatus.textContent = response.detail;
+    verificationPin.value = "";
+  } catch (error) {
+    verificationStatus.textContent = error.message;
+  } finally {
+    verificationResend.disabled = false;
+  }
+}
+
 function setMode(mode) {
   state.mode = mode;
   const isLogin = mode === "login";
@@ -10,15 +72,16 @@ function setMode(mode) {
   usernameField.classList.toggle("hidden", isLogin);
   forgotPasswordButton.classList.toggle("hidden", !isLogin);
   usernameInput.required = !isLogin;
+  document.querySelector("#registration-terms").classList.toggle("hidden", isLogin);
+  document.querySelector("#registration-terms-accepted").checked = false;
+  document.querySelector("#registration-terms-accepted").required = !isLogin && Boolean(registrationTerms?.configured);
+  if (!isLogin) loadRegistrationTerms().catch(error => { authError.textContent = error.message; });
   passwordInput.autocomplete = isLogin ? "current-password" : "new-password";
   authHeading.textContent = isLogin ? "Return to your space" : "Create your private space";
   authSubmit.textContent = isLogin ? "Login" : "Create account";
   authError.textContent = "";
   renderCaptcha().catch((error) => {
     captchaStatus.textContent = error instanceof Error ? error.message : String(error);
-  });
-  renderGoogleAuth().catch((error) => {
-    if (authStatus) authStatus.textContent = error instanceof Error ? error.message : String(error);
   });
 }
 
@@ -97,68 +160,6 @@ async function renderCaptcha() {
   captchaStatus.textContent = "";
 }
 
-async function loadGoogleConfig() {
-  try {
-    state.google.config = await api("/auth/google/config");
-  } catch {
-    state.google.config = { enabled: false, client_id: null };
-  }
-}
-
-function loadGoogleScript() {
-  if (window.google?.accounts?.id) return Promise.resolve();
-  if (googleScriptPromise) return googleScriptPromise;
-
-  googleScriptPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.onload = resolve;
-    script.onerror = () => reject(new Error("Could not load Google sign-in."));
-    document.head.append(script);
-  });
-  return googleScriptPromise;
-}
-
-async function renderGoogleAuth() {
-  if (!googleAuthField || !googleButton) return;
-  const enabled = state.google.config.enabled && state.google.config.client_id;
-  googleAuthField.classList.toggle("hidden", !enabled);
-  if (!enabled || state.google.buttonRendered) return;
-
-  await loadGoogleScript();
-  window.google.accounts.id.initialize({
-    client_id: state.google.config.client_id,
-    callback: handleGoogleCredential,
-  });
-  window.google.accounts.id.renderButton(googleButton, {
-    theme: "outline",
-    size: "large",
-    width: googleButton.offsetWidth || 320,
-    text: state.mode === "register" ? "signup_with" : "signin_with",
-  });
-  state.google.buttonRendered = true;
-}
-
-async function handleGoogleCredential(response) {
-  if (!response?.credential) return;
-  if (authStatus) authStatus.textContent = "Signing in with Google...";
-  try {
-    const payload = await api("/auth/google", {
-      method: "POST",
-      body: JSON.stringify({ credential: response.credential }),
-    });
-    state.token = payload.access_token;
-    localStorage.setItem("feely_token", state.token);
-    if (authStatus) authStatus.textContent = "";
-    await showChat({ startFreshChat: true });
-  } catch (error) {
-    authError.textContent = error instanceof Error ? error.message : String(error);
-    if (authStatus) authStatus.textContent = "";
-  }
-}
-
 let sessionExpiryTimer = null;
 let sessionCheckPending = false;
 
@@ -222,6 +223,7 @@ function showAuth() {
 async function showChat({ startFreshChat = false } = {}) {
   scheduleSessionExpiry();
   if (!state.token) return;
+  if (!await ensureTermsAccepted()) return;
   if (startFreshChat) state.activeChatId = null;
   authView.classList.add("hidden");
   chatView.classList.remove("hidden");
@@ -243,12 +245,13 @@ async function showChat({ startFreshChat = false } = {}) {
 }
 
 async function registerAndLogin() {
+  const termsPayload = await registrationTermsPayload();
   const captchaIsEnabled = state.captcha.config.enabled;
   if (captchaIsEnabled && !state.captcha.token) {
     throw new Error("Please complete the verification before creating an account.");
   }
 
-  await api("/auth/register", {
+  const registered = await api("/auth/register", {
     method: "POST",
     body: JSON.stringify({
       email: emailInput.value.trim(),
@@ -256,19 +259,35 @@ async function registerAndLogin() {
       password: passwordInput.value,
       website: websiteInput?.value.trim() || "",
       captcha_token: captchaIsEnabled ? state.captcha.token : null,
+      ...termsPayload,
     }),
   });
+  if (!registered.is_email_verified) {
+    passwordInput.value = "";
+    setMode("login");
+    openEmailVerification(registered.email, "We sent your activation PIN. Check your inbox and spam folder.");
+    return;
+  }
   await login();
 }
 
 async function login() {
-  const payload = await api("/auth/login", {
-    method: "POST",
-    body: JSON.stringify({
-      email_or_username: emailInput.value.trim(),
-      password: passwordInput.value,
-    }),
-  });
+  let payload;
+  try {
+    payload = await api("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({
+        email_or_username: emailInput.value.trim(),
+        password: passwordInput.value,
+      }),
+    });
+  } catch (error) {
+    if (error.status === 403 && error.message.includes("verify your email")) {
+      openEmailVerification(emailInput.value.trim(), "Enter your PIN or request a new one to activate your account.");
+      return;
+    }
+    throw error;
+  }
   state.token = payload.access_token;
   localStorage.setItem("feely_token", state.token);
   await showChat({ startFreshChat: true });
@@ -342,6 +361,10 @@ async function confirmPasswordReset(event) {
 }
 
 function logout() {
+  feedbackForm.reset();
+  feedbackStatus.textContent = "";
+  state.chatRequest?.controller.abort();
+  state.chatRequest = null;
   clearTimeout(sessionExpiryTimer);
   sessionExpiryTimer = null;
   state.token = null;

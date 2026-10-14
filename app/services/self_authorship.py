@@ -229,7 +229,7 @@ def create_or_link_topic_space(
     title: str,
     description: str,
     chat_id: str,
-    category: str = "other",
+    category: str | None = None,
     related_topic_ids: list[str] | None = None,
     parent_topic_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -246,11 +246,16 @@ def create_or_link_topic_space(
         space["chat_ids"] = chat_ids
         if related_topic_ids:
             set_related_topics(
-                map_data, topic_space=space,
-                related_topic_ids=list(dict.fromkeys([*space["related_topic_ids"], *related_topic_ids])),
+                map_data,
+                topic_space=space,
+                related_topic_ids=list(
+                    dict.fromkeys([*space["related_topic_ids"], *related_topic_ids])
+                ),
             )
         if description.strip() and not space.get("description"):
             space["description"] = description.strip()
+        if category is not None:
+            space["category"] = normalize_topic_category(category)
         if parent_topic_id is not None:
             validate_parent_topic(
                 map_data,
@@ -462,9 +467,7 @@ def merge_topic_spaces(
         ancestor_id = find_topic_space(map_data, ancestor_id).get("parent_topic_id")
 
     for field in ("chat_ids", "journal_dates"):
-        target[field] = list(
-            dict.fromkeys([*target.get(field, []), *source.get(field, [])])
-        )
+        target[field] = list(dict.fromkeys([*target.get(field, []), *source.get(field, [])]))
 
     entries_by_id: dict[str, dict[str, Any]] = {}
     entries_without_id: list[dict[str, Any]] = []
@@ -516,9 +519,7 @@ def merge_topic_spaces(
         next_related_ids: list[str] = []
         for related_id in space.get("related_topic_ids", []):
             replacement_id = (
-                target_topic_space_id
-                if related_id == source_topic_space_id
-                else related_id
+                target_topic_space_id if related_id == source_topic_space_id else related_id
             )
             if replacement_id != space_id and replacement_id not in next_related_ids:
                 next_related_ids.append(replacement_id)
@@ -624,7 +625,9 @@ def add_map_entry(
     return write_map(profile_data, map_data), entry
 
 
-def find_entry_group(map_data: dict[str, Any], entry_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def find_entry_group(
+    map_data: dict[str, Any], entry_id: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     entry_groups = [map_data["unassigned_entries"]]
     entry_groups.extend(space.get("entries", []) for space in map_data["topic_spaces"])
 
